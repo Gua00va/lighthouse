@@ -34,8 +34,6 @@ pub enum Database<'env> {
     Mdbx(mdbx_impl::Database<'env>),
     #[cfg(feature = "lmdb")]
     Lmdb(lmdb_impl::Database<'env>),
-    #[cfg(feature = "redb")]
-    Redb(redb_impl::Database<'env>),
     Disabled(PhantomData<&'env ()>),
 }
 
