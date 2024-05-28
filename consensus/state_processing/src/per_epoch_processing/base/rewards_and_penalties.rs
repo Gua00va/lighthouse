@@ -105,13 +105,13 @@ pub fn get_attestation_deltas_all<E: EthSpec>(
 pub fn get_attestation_deltas_subset<E: EthSpec>(
     state: &BeaconState<E>,
     validator_statuses: &ValidatorStatuses,
-    validators_subset: &Vec<usize>,
+    validators_subset: &[usize],
     spec: &ChainSpec,
 ) -> Result<Vec<(usize, AttestationDelta)>, Error> {
     get_attestation_deltas(
         state,
         validator_statuses,
-        RewardsCalculationType::API(validators_subset.clone()),
+        RewardsCalculationType::API(validators_subset.to_owned()),
         spec,
     )
     .map(|deltas| {
@@ -196,16 +196,12 @@ fn get_attestation_deltas<E: EthSpec>(
         }
 
         if let Some((proposer_index, proposer_delta)) = proposer_delta {
-            match maybe_validators_subset {
-                RewardsCalculationType::Consensus => {
-                    deltas
-                        .get_mut(proposer_index)
-                        .ok_or(Error::ValidatorStatusesInconsistent)?
-                        .inclusion_delay_delta
-                        .combine(proposer_delta)?;
-                }
-
-                _ => (),
+            if let RewardsCalculationType::Consensus = maybe_validators_subset {
+                deltas
+                    .get_mut(proposer_index)
+                    .ok_or(Error::ValidatorStatusesInconsistent)?
+                    .inclusion_delay_delta
+                    .combine(proposer_delta)?;
             }
         }
     }
