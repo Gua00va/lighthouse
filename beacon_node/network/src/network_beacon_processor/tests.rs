@@ -93,7 +93,7 @@ impl TestRig {
         spec.shard_committee_period = 2;
 
         let harness = BeaconChainHarness::builder(MainnetEthSpec)
-            .spec(spec)
+            .spec(spec.clone())
             .deterministic_keypairs(VALIDATOR_COUNT)
             .fresh_ephemeral_store()
             .mock_execution_layer()
@@ -204,7 +204,14 @@ impl TestRig {
         });
         let enr_key = CombinedKey::generate_secp256k1();
         let enr = enr::Enr::builder().build(&enr_key).unwrap();
-        let network_globals = Arc::new(NetworkGlobals::new(enr, meta_data, vec![], false, &log));
+        let network_globals = Arc::new(NetworkGlobals::new(
+            enr,
+            meta_data,
+            vec![],
+            false,
+            &log,
+            spec,
+        ));
 
         let executor = harness.runtime.task_executor.clone();
 
@@ -239,6 +246,11 @@ impl TestRig {
             Some(work_journal_tx),
             harness.chain.slot_clock.clone(),
             chain.spec.maximum_gossip_clock_disparity(),
+            BeaconProcessorQueueLengths::from_state(
+                &chain.canonical_head.cached_head().snapshot.beacon_state,
+                &chain.spec,
+            )
+            .unwrap(),
         );
 
         assert!(beacon_processor.is_ok());
@@ -788,9 +800,7 @@ async fn aggregate_attestation_to_unknown_block(import_method: BlockImportMethod
     let mut rig = TestRig::new(SMALL_CHAIN).await;
 
     // Empty the op pool.
-    rig.chain
-        .op_pool
-        .prune_attestations(u64::max_value().into());
+    rig.chain.op_pool.prune_attestations(u64::MAX.into());
     assert_eq!(rig.chain.op_pool.num_attestations(), 0);
 
     // Send the attestation but not the block, and check that it was not imported.

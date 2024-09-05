@@ -1,10 +1,19 @@
 use beacon_chain::get_block_root;
-use lighthouse_network::rpc::{methods::BlobsByRootRequest, BlocksByRootRequest};
+use lighthouse_network::{
+    rpc::{methods::BlobsByRootRequest, BlocksByRootRequest},
+    PeerId,
+};
 use std::sync::Arc;
 use strum::IntoStaticStr;
 use types::{
     blob_sidecar::BlobIdentifier, BlobSidecar, ChainSpec, EthSpec, Hash256, SignedBeaconBlock,
 };
+
+pub use data_columns_by_root::{
+    ActiveDataColumnsByRootRequest, DataColumnsByRootSingleBlockRequest,
+};
+
+mod data_columns_by_root;
 
 #[derive(Debug, PartialEq, Eq, IntoStaticStr)]
 pub enum LookupVerifyError {
@@ -12,7 +21,7 @@ pub enum LookupVerifyError {
     NotEnoughResponsesReturned { expected: usize, actual: usize },
     TooManyResponses,
     UnrequestedBlockRoot(Hash256),
-    UnrequestedBlobIndex(u64),
+    UnrequestedIndex(u64),
     InvalidInclusionProof,
     DuplicateData,
 }
@@ -20,13 +29,15 @@ pub enum LookupVerifyError {
 pub struct ActiveBlocksByRootRequest {
     request: BlocksByRootSingleRequest,
     resolved: bool,
+    pub(crate) peer_id: PeerId,
 }
 
 impl ActiveBlocksByRootRequest {
-    pub fn new(request: BlocksByRootSingleRequest) -> Self {
+    pub fn new(request: BlocksByRootSingleRequest, peer_id: PeerId) -> Self {
         Self {
             request,
             resolved: false,
+            peer_id,
         }
     }
 
@@ -94,14 +105,16 @@ pub struct ActiveBlobsByRootRequest<E: EthSpec> {
     request: BlobsByRootSingleBlockRequest,
     blobs: Vec<Arc<BlobSidecar<E>>>,
     resolved: bool,
+    pub(crate) peer_id: PeerId,
 }
 
 impl<E: EthSpec> ActiveBlobsByRootRequest<E> {
-    pub fn new(request: BlobsByRootSingleBlockRequest) -> Self {
+    pub fn new(request: BlobsByRootSingleBlockRequest, peer_id: PeerId) -> Self {
         Self {
             request,
             blobs: vec![],
             resolved: false,
+            peer_id,
         }
     }
 
@@ -120,11 +133,11 @@ impl<E: EthSpec> ActiveBlobsByRootRequest<E> {
         if self.request.block_root != block_root {
             return Err(LookupVerifyError::UnrequestedBlockRoot(block_root));
         }
-        if !blob.verify_blob_sidecar_inclusion_proof().unwrap_or(false) {
+        if !blob.verify_blob_sidecar_inclusion_proof() {
             return Err(LookupVerifyError::InvalidInclusionProof);
         }
         if !self.request.indices.contains(&blob.index) {
-            return Err(LookupVerifyError::UnrequestedBlobIndex(blob.index));
+            return Err(LookupVerifyError::UnrequestedIndex(blob.index));
         }
         if self.blobs.iter().any(|b| b.index == blob.index) {
             return Err(LookupVerifyError::DuplicateData);

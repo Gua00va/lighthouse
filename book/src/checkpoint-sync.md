@@ -146,10 +146,21 @@ For more information on historic state storage see the
 
 To manually specify a checkpoint use the following two flags:
 
-* `--checkpoint-state`: accepts an SSZ-encoded `BeaconState` blob
-* `--checkpoint-block`: accepts an SSZ-encoded `SignedBeaconBlock` blob
+* `--checkpoint-state`: accepts an SSZ-encoded `BeaconState` file
+* `--checkpoint-block`: accepts an SSZ-encoded `SignedBeaconBlock` file
+* `--checkpoint-blobs`: accepts an SSZ-encoded `Blobs` file
 
-_Both_ the state and block must be provided and the state **must** match the block. The
+The command is as following:
+
+```bash
+curl -H "Accept: application/octet-stream" "http://localhost:5052/eth/v2/debug/beacon/states/$SLOT" > state.ssz
+curl -H "Accept: application/octet-stream" "http://localhost:5052/eth/v2/beacon/blocks/$SLOT" > block.ssz
+curl -H "Accept: application/octet-stream" "http://localhost:5052/eth/v1/beacon/blob_sidecars/$SLOT" > blobs.ssz
+```
+
+where `$SLOT` is the slot number. A slot which is an epoch boundary slot (i.e., first slot of an epoch) should always be used for manual checkpoint sync.
+
+If the block contains blobs, all state, block and blobs must be provided and must point to the same slot. The
 state may be from the same slot as the block (unadvanced), or advanced to an epoch boundary,
 in which case it will be assumed to be finalized at that epoch.
 

@@ -1,10 +1,7 @@
 use crate::network_beacon_processor::NetworkBeaconProcessor;
-
-use crate::service::RequestId;
-use crate::sync::manager::{
-    BlockProcessType, RequestId as SyncRequestId, SingleLookupReqId, SyncManager,
-};
-use crate::sync::SyncMessage;
+use crate::sync::manager::{BlockProcessType, SyncManager};
+use crate::sync::sampling::SamplingConfig;
+use crate::sync::{SamplingId, SyncMessage};
 use crate::NetworkMessage;
 use std::sync::Arc;
 
@@ -12,30 +9,38 @@ use super::*;
 
 use crate::sync::block_lookups::common::ResponseType;
 use beacon_chain::blob_verification::GossipVerifiedBlob;
-use beacon_chain::block_verification_types::{BlockImportData, RpcBlock};
+use beacon_chain::block_verification_types::BlockImportData;
 use beacon_chain::builder::Witness;
 use beacon_chain::data_availability_checker::Availability;
 use beacon_chain::eth1_chain::CachingEth1Backend;
 use beacon_chain::test_utils::{
-    build_log, generate_rand_block_and_blobs, BeaconChainHarness, EphemeralHarnessType, NumBlobs,
+    build_log, generate_rand_block_and_blobs, generate_rand_block_and_data_columns, test_spec,
+    BeaconChainHarness, EphemeralHarnessType, NumBlobs,
 };
+use beacon_chain::validator_monitor::timestamp_now;
 use beacon_chain::{
     AvailabilityPendingExecutedBlock, PayloadVerificationOutcome, PayloadVerificationStatus,
 };
 use beacon_processor::WorkEvent;
 use lighthouse_network::rpc::{RPCError, RPCResponseErrorCode};
+use lighthouse_network::service::api_types::{
+    AppRequestId, DataColumnsByRootRequester, Id, SamplingRequester, SingleLookupReqId,
+    SyncRequestId,
+};
 use lighthouse_network::types::SyncState;
 use lighthouse_network::{NetworkGlobals, Request};
 use slog::info;
 use slot_clock::{ManualSlotClock, SlotClock, TestingSlotClock};
 use store::MemoryStore;
 use tokio::sync::mpsc;
+use types::data_column_sidecar::ColumnIndex;
 use types::test_utils::TestRandom;
 use types::{
     test_utils::{SeedableRng, XorShiftRng},
     BlobSidecar, ForkName, MinimalEthSpec as E, SignedBeaconBlock, Slot,
 };
 use types::{BeaconState, BeaconStateBase};
+use types::{DataColumnSidecar, Epoch};
 
 type T = Witness<ManualSlotClock, CachingEth1Backend<E>, E, MemoryStore<E>, MemoryStore<E>>;
 
@@ -86,15 +91,32 @@ struct TestRig {
 
 const D: Duration = Duration::new(0, 0);
 const PARENT_FAIL_TOLERANCE: u8 = SINGLE_BLOCK_LOOKUP_MAX_ATTEMPTS;
+const SAMPLING_REQUIRED_SUCCESSES: usize = 2;
+
+type DCByRootIds = Vec<DCByRootId>;
+type DCByRootId = (SyncRequestId, Vec<ColumnIndex>);
+
+struct TestRigConfig {
+    peer_das_enabled: bool,
+}
 
 impl TestRig {
-    fn test_setup() -> Self {
+    fn test_setup_with_config(config: Option<TestRigConfig>) -> Self {
         let enable_log = cfg!(feature = "test_logger");
         let log = build_log(slog::Level::Trace, enable_log);
 
+        // Use `fork_from_env` logic to set correct fork epochs
+        let mut spec = test_spec::<E>();
+
+        if let Some(config) = config {
+            if config.peer_das_enabled {
+                spec.eip7594_fork_epoch = Some(Epoch::new(0));
+            }
+        }
+
         // Initialise a new beacon chain
         let harness = BeaconChainHarness::<EphemeralHarnessType<E>>::builder(E)
-            .default_spec()
+            .spec(spec)
             .logger(log.clone())
             .deterministic_keypairs(1)
             .fresh_ephemeral_store()
@@ -108,7 +130,13 @@ impl TestRig {
         let chain = harness.chain.clone();
 
         let (network_tx, network_rx) = mpsc::unbounded_channel();
-        let globals = Arc::new(NetworkGlobals::new_test_globals(Vec::new(), &log));
+        // TODO(das): make the generation of the ENR use the deterministic rng to have consistent
+        // column assignments
+        let globals = Arc::new(NetworkGlobals::new_test_globals(
+            Vec::new(),
+            &log,
+            chain.spec.clone(),
+        ));
         let (beacon_processor, beacon_processor_rx) = NetworkBeaconProcessor::null_for_testing(
             globals,
             chain.clone(),
@@ -138,6 +166,9 @@ impl TestRig {
                 network_tx,
                 beacon_processor.into(),
                 sync_recv,
+                SamplingConfig::Custom {
+                    required_successes: vec![SAMPLING_REQUIRED_SUCCESSES],
+                },
                 log.clone(),
             ),
             harness,
@@ -146,8 +177,23 @@ impl TestRig {
         }
     }
 
+    fn test_setup() -> Self {
+        Self::test_setup_with_config(None)
+    }
+
     fn test_setup_after_deneb() -> Option<Self> {
         let r = Self::test_setup();
+        if r.after_deneb() {
+            Some(r)
+        } else {
+            None
+        }
+    }
+
+    fn test_setup_after_peerdas() -> Option<Self> {
+        let r = Self::test_setup_with_config(Some(TestRigConfig {
+            peer_das_enabled: true,
+        }));
         if r.after_deneb() {
             Some(r)
         } else {
@@ -165,11 +211,7 @@ impl TestRig {
 
     fn trigger_unknown_parent_block(&mut self, peer_id: PeerId, block: Arc<SignedBeaconBlock<E>>) {
         let block_root = block.canonical_root();
-        self.send_sync_message(SyncMessage::UnknownParentBlock(
-            peer_id,
-            RpcBlock::new_without_blobs(Some(block_root), block),
-            block_root,
-        ))
+        self.send_sync_message(SyncMessage::UnknownParentBlock(peer_id, block, block_root))
     }
 
     fn trigger_unknown_parent_blob(&mut self, peer_id: PeerId, blob: BlobSidecar<E>) {
@@ -180,6 +222,10 @@ impl TestRig {
         self.send_sync_message(SyncMessage::UnknownBlockHashFromAttestation(
             peer_id, block_root,
         ));
+    }
+
+    fn trigger_sample_block(&mut self, block_root: Hash256, block_slot: Slot) {
+        self.send_sync_message(SyncMessage::SampleBlock(block_root, block_slot))
     }
 
     fn rand_block(&mut self) -> SignedBeaconBlock<E> {
@@ -193,6 +239,18 @@ impl TestRig {
         let fork_name = self.fork_name;
         let rng = &mut self.rng;
         generate_rand_block_and_blobs::<E>(fork_name, num_blobs, rng)
+    }
+
+    fn rand_block_and_data_columns(
+        &mut self,
+    ) -> (SignedBeaconBlock<E>, Vec<Arc<DataColumnSidecar<E>>>) {
+        let num_blobs = NumBlobs::Number(1);
+        generate_rand_block_and_data_columns::<E>(
+            self.fork_name,
+            num_blobs,
+            &mut self.rng,
+            &self.harness.spec,
+        )
     }
 
     pub fn rand_block_and_parent(
@@ -210,7 +268,7 @@ impl TestRig {
         self.sync_manager.handle_message(sync_message);
     }
 
-    fn active_single_lookups(&self) -> Vec<(Id, Hash256, Option<Hash256>)> {
+    fn active_single_lookups(&self) -> Vec<BlockLookupSummary> {
         self.sync_manager.active_single_lookups()
     }
 
@@ -235,6 +293,20 @@ impl TestRig {
         );
     }
 
+    fn expect_no_active_sampling(&mut self) {
+        assert_eq!(
+            self.sync_manager.active_sampling_requests(),
+            Vec::<Hash256>::new(),
+            "expected no active sampling"
+        );
+    }
+
+    fn expect_clean_finished_sampling(&mut self) {
+        self.expect_empty_network();
+        self.expect_sampling_result_work();
+        self.expect_no_active_sampling();
+    }
+
     fn assert_parent_lookups_count(&self, count: usize) {
         assert_eq!(
             self.active_parent_lookups_count(),
@@ -252,6 +324,21 @@ impl TestRig {
         }
     }
 
+    fn assert_lookup_peers(&self, block_root: Hash256, mut expected_peers: Vec<PeerId>) {
+        let mut lookup = self
+            .sync_manager
+            .active_single_lookups()
+            .into_iter()
+            .find(|l| l.1 == block_root)
+            .unwrap_or_else(|| panic!("no lookup for {block_root}"));
+        lookup.3.sort();
+        expected_peers.sort();
+        assert_eq!(
+            lookup.3, expected_peers,
+            "unexpected peers on lookup {block_root}"
+        );
+    }
+
     fn insert_failed_chain(&mut self, block_root: Hash256) {
         self.sync_manager.insert_failed_chain(block_root);
     }
@@ -263,18 +350,22 @@ impl TestRig {
         }
     }
 
-    fn failed_chains_contains(&mut self, chain_hash: &Hash256) -> bool {
-        self.sync_manager.get_failed_chains().contains(chain_hash)
+    fn assert_failed_chain(&mut self, chain_hash: Hash256) {
+        let failed_chains = self.sync_manager.get_failed_chains();
+        if !failed_chains.contains(&chain_hash) {
+            panic!("expected failed chains to contain {chain_hash:?}: {failed_chains:?}");
+        }
     }
 
     fn find_single_lookup_for(&self, block_root: Hash256) -> Id {
         self.active_single_lookups()
             .iter()
-            .find(|(_, b, _)| b == &block_root)
+            .find(|l| l.1 == block_root)
             .unwrap_or_else(|| panic!("no single block lookup found for {block_root}"))
             .0
     }
 
+    #[track_caller]
     fn expect_no_active_single_lookups(&self) {
         assert!(
             self.active_single_lookups().is_empty(),
@@ -283,6 +374,7 @@ impl TestRig {
         );
     }
 
+    #[track_caller]
     fn expect_no_active_lookups(&self) {
         self.expect_no_active_single_lookups();
     }
@@ -293,12 +385,26 @@ impl TestRig {
     }
 
     fn new_connected_peer(&mut self) -> PeerId {
-        let peer_id = PeerId::random();
         self.network_globals
             .peers
             .write()
-            .__add_connected_peer_testing_only(&peer_id);
-        peer_id
+            .__add_connected_peer_testing_only(false, &self.harness.spec)
+    }
+
+    fn new_connected_supernode_peer(&mut self) -> PeerId {
+        self.network_globals
+            .peers
+            .write()
+            .__add_connected_peer_testing_only(true, &self.harness.spec)
+    }
+
+    fn new_connected_peers_for_peerdas(&mut self) {
+        // Enough sampling peers with few columns
+        for _ in 0..100 {
+            self.new_connected_peer();
+        }
+        // One supernode peer to ensure all columns have at least one peer
+        self.new_connected_supernode_peer();
     }
 
     fn parent_chain_processed_success(
@@ -330,12 +436,12 @@ impl TestRig {
         *parent_chain.last().unwrap()
     }
 
-    fn parent_block_processed(&mut self, chain_hash: Hash256, result: BlockProcessingResult<E>) {
+    fn parent_block_processed(&mut self, chain_hash: Hash256, result: BlockProcessingResult) {
         let id = self.find_single_lookup_for(self.find_oldest_parent_lookup(chain_hash));
         self.single_block_component_processed(id, result);
     }
 
-    fn parent_blob_processed(&mut self, chain_hash: Hash256, result: BlockProcessingResult<E>) {
+    fn parent_blob_processed(&mut self, chain_hash: Hash256, result: BlockProcessingResult) {
         let id = self.find_single_lookup_for(self.find_oldest_parent_lookup(chain_hash));
         self.single_blob_component_processed(id, result);
     }
@@ -347,7 +453,7 @@ impl TestRig {
         );
     }
 
-    fn single_block_component_processed(&mut self, id: Id, result: BlockProcessingResult<E>) {
+    fn single_block_component_processed(&mut self, id: Id, result: BlockProcessingResult) {
         self.send_sync_message(SyncMessage::BlockComponentProcessed {
             process_type: BlockProcessType::SingleBlock { id },
             result,
@@ -362,7 +468,7 @@ impl TestRig {
         )
     }
 
-    fn single_blob_component_processed(&mut self, id: Id, result: BlockProcessingResult<E>) {
+    fn single_blob_component_processed(&mut self, id: Id, result: BlockProcessingResult) {
         self.send_sync_message(SyncMessage::BlockComponentProcessed {
             process_type: BlockProcessType::SingleBlob { id },
             result,
@@ -524,8 +630,180 @@ impl TestRig {
         })
     }
 
-    fn peer_disconnected(&mut self, disconnected_peer_id: PeerId) {
-        self.send_sync_message(SyncMessage::Disconnect(disconnected_peer_id));
+    fn return_empty_sampling_requests(&mut self, ids: DCByRootIds) {
+        for id in ids {
+            self.log(&format!("return empty data column for {id:?}"));
+            self.return_empty_sampling_request(id)
+        }
+    }
+
+    fn return_empty_sampling_request(&mut self, (request_id, _): DCByRootId) {
+        let peer_id = PeerId::random();
+        // Send stream termination
+        self.send_sync_message(SyncMessage::RpcDataColumn {
+            request_id,
+            peer_id,
+            data_column: None,
+            seen_timestamp: timestamp_now(),
+        });
+    }
+
+    fn sampling_requests_failed(
+        &mut self,
+        sampling_ids: DCByRootIds,
+        peer_id: PeerId,
+        error: RPCError,
+    ) {
+        for (request_id, _) in sampling_ids {
+            self.send_sync_message(SyncMessage::RpcError {
+                peer_id,
+                request_id,
+                error: error.clone(),
+            })
+        }
+    }
+
+    fn complete_valid_block_request(
+        &mut self,
+        id: SingleLookupReqId,
+        block: Arc<SignedBeaconBlock<E>>,
+        missing_components: bool,
+    ) {
+        // Complete download
+        let peer_id = PeerId::random();
+        let slot = block.slot();
+        let block_root = block.canonical_root();
+        self.single_lookup_block_response(id, peer_id, Some(block));
+        self.single_lookup_block_response(id, peer_id, None);
+        // Expect processing and resolve with import
+        self.expect_block_process(ResponseType::Block);
+        self.single_block_component_processed(
+            id.lookup_id,
+            if missing_components {
+                BlockProcessingResult::Ok(AvailabilityProcessingStatus::MissingComponents(
+                    slot, block_root,
+                ))
+            } else {
+                BlockProcessingResult::Ok(AvailabilityProcessingStatus::Imported(block_root))
+            },
+        )
+    }
+
+    fn complete_valid_sampling_column_requests(
+        &mut self,
+        ids: DCByRootIds,
+        data_columns: Vec<Arc<DataColumnSidecar<E>>>,
+    ) {
+        for id in ids {
+            self.log(&format!("return valid data column for {id:?}"));
+            let indices = &id.1;
+            let columns_to_send = indices
+                .iter()
+                .map(|&i| data_columns[i as usize].clone())
+                .collect::<Vec<_>>();
+            self.complete_valid_sampling_column_request(id, &columns_to_send);
+        }
+    }
+
+    fn complete_valid_sampling_column_request(
+        &mut self,
+        id: DCByRootId,
+        data_columns: &[Arc<DataColumnSidecar<E>>],
+    ) {
+        let first_dc = data_columns.first().unwrap();
+        let block_root = first_dc.block_root();
+        let sampling_request_id = match id.0 {
+            SyncRequestId::DataColumnsByRoot(
+                _,
+                _requester @ DataColumnsByRootRequester::Sampling(sampling_id),
+            ) => sampling_id.sampling_request_id,
+            _ => unreachable!(),
+        };
+        self.complete_data_columns_by_root_request(id, data_columns);
+
+        // Expect work event
+        // TODO(das): worth it to append sender id to the work event for stricter assertion?
+        self.expect_rpc_sample_verify_work_event();
+
+        // Respond with valid result
+        self.send_sync_message(SyncMessage::SampleVerified {
+            id: SamplingId {
+                id: SamplingRequester::ImportedBlock(block_root),
+                sampling_request_id,
+            },
+            result: Ok(()),
+        })
+    }
+
+    fn complete_valid_custody_request(
+        &mut self,
+        ids: DCByRootIds,
+        data_columns: Vec<Arc<DataColumnSidecar<E>>>,
+        missing_components: bool,
+    ) {
+        let lookup_id =
+            if let SyncRequestId::DataColumnsByRoot(_, DataColumnsByRootRequester::Custody(id)) =
+                ids.first().unwrap().0
+            {
+                id.requester.0.lookup_id
+            } else {
+                panic!("not a custody requester")
+            };
+
+        let first_column = data_columns.first().cloned().unwrap();
+
+        for id in ids {
+            self.log(&format!("return valid data column for {id:?}"));
+            let indices = &id.1;
+            let columns_to_send = indices
+                .iter()
+                .map(|&i| data_columns[i as usize].clone())
+                .collect::<Vec<_>>();
+            self.complete_data_columns_by_root_request(id, &columns_to_send);
+        }
+
+        // Expect work event
+        // TODO(das): worth it to append sender id to the work event for stricter assertion?
+        self.expect_rpc_custody_column_work_event();
+
+        // Respond with valid result
+        self.send_sync_message(SyncMessage::BlockComponentProcessed {
+            process_type: BlockProcessType::SingleCustodyColumn(lookup_id),
+            result: if missing_components {
+                BlockProcessingResult::Ok(AvailabilityProcessingStatus::MissingComponents(
+                    first_column.slot(),
+                    first_column.block_root(),
+                ))
+            } else {
+                BlockProcessingResult::Ok(AvailabilityProcessingStatus::Imported(
+                    first_column.block_root(),
+                ))
+            },
+        });
+    }
+
+    fn complete_data_columns_by_root_request(
+        &mut self,
+        (request_id, _): DCByRootId,
+        data_columns: &[Arc<DataColumnSidecar<E>>],
+    ) {
+        let peer_id = PeerId::random();
+        for data_column in data_columns {
+            // Send chunks
+            self.send_sync_message(SyncMessage::RpcDataColumn {
+                request_id,
+                peer_id,
+                data_column: Some(data_column.clone()),
+                seen_timestamp: timestamp_now(),
+            });
+        }
+        // Send stream termination
+        self.send_sync_message(SyncMessage::RpcDataColumn {
+            request_id,
+            peer_id,
+            data_column: None,
+            seen_timestamp: timestamp_now(),
+        });
     }
 
     /// Return RPCErrors for all active requests of peer
@@ -534,7 +812,7 @@ impl TestRig {
         while let Ok(request_id) = self.pop_received_network_event(|ev| match ev {
             NetworkMessage::SendRequest {
                 peer_id,
-                request_id: RequestId::Sync(id),
+                request_id: AppRequestId::Sync(id),
                 ..
             } if *peer_id == disconnected_peer_id => Some(*id),
             _ => None,
@@ -545,6 +823,10 @@ impl TestRig {
                 error: RPCError::Disconnected,
             });
         }
+    }
+
+    fn peer_disconnected(&mut self, peer_id: PeerId) {
+        self.send_sync_message(SyncMessage::Disconnect(peer_id));
     }
 
     fn drain_network_rx(&mut self) {
@@ -611,7 +893,7 @@ impl TestRig {
             NetworkMessage::SendRequest {
                 peer_id: _,
                 request: Request::BlocksByRoot(request),
-                request_id: RequestId::Sync(SyncRequestId::SingleBlock { id }),
+                request_id: AppRequestId::Sync(SyncRequestId::SingleBlock { id }),
             } if request.block_roots().to_vec().contains(&for_block) => Some(*id),
             _ => None,
         })
@@ -631,7 +913,7 @@ impl TestRig {
             NetworkMessage::SendRequest {
                 peer_id: _,
                 request: Request::BlobsByRoot(request),
-                request_id: RequestId::Sync(SyncRequestId::SingleBlob { id }),
+                request_id: AppRequestId::Sync(SyncRequestId::SingleBlob { id }),
             } if request
                 .blob_ids
                 .to_vec()
@@ -656,7 +938,7 @@ impl TestRig {
             NetworkMessage::SendRequest {
                 peer_id: _,
                 request: Request::BlocksByRoot(request),
-                request_id: RequestId::Sync(SyncRequestId::SingleBlock { id }),
+                request_id: AppRequestId::Sync(SyncRequestId::SingleBlock { id }),
             } if request.block_roots().to_vec().contains(&for_block) => Some(*id),
             _ => None,
         })
@@ -678,7 +960,7 @@ impl TestRig {
             NetworkMessage::SendRequest {
                 peer_id: _,
                 request: Request::BlobsByRoot(request),
-                request_id: RequestId::Sync(SyncRequestId::SingleBlob { id }),
+                request_id: AppRequestId::Sync(SyncRequestId::SingleBlob { id }),
             } if request
                 .blob_ids
                 .to_vec()
@@ -690,6 +972,59 @@ impl TestRig {
             _ => None,
         })
         .unwrap_or_else(|e| panic!("Expected blob parent request for {for_block:?}: {e}"))
+    }
+
+    /// Retrieves an unknown number of requests for data columns of `block_root`. Because peer ENRs
+    /// are random, and peer selection is random, the total number of batched requests is unknown.
+    fn expect_data_columns_by_root_requests(
+        &mut self,
+        block_root: Hash256,
+        count: usize,
+    ) -> DCByRootIds {
+        let mut requests: DCByRootIds = vec![];
+        loop {
+            let req = self
+                .pop_received_network_event(|ev| match ev {
+                    NetworkMessage::SendRequest {
+                        peer_id: _,
+                        request: Request::DataColumnsByRoot(request),
+                        request_id: AppRequestId::Sync(id @ SyncRequestId::DataColumnsByRoot { .. }),
+                    } if request
+                        .data_column_ids
+                        .to_vec()
+                        .iter()
+                        .any(|r| r.block_root == block_root) =>
+                    {
+                        let indices = request
+                            .data_column_ids
+                            .to_vec()
+                            .iter()
+                            .map(|cid| cid.index)
+                            .collect::<Vec<_>>();
+                        Some((*id, indices))
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|e| {
+                    panic!("Expected more DataColumnsByRoot requests for {block_root:?}: {e}")
+                });
+            requests.push(req);
+
+            // Should never infinite loop because sync does not send requests for 0 columns
+            if requests.iter().map(|r| r.1.len()).sum::<usize>() >= count {
+                return requests;
+            }
+        }
+    }
+
+    fn expect_only_data_columns_by_root_requests(
+        &mut self,
+        for_block: Hash256,
+        count: usize,
+    ) -> DCByRootIds {
+        let ids = self.expect_data_columns_by_root_requests(for_block, count);
+        self.expect_empty_network();
+        ids
     }
 
     #[track_caller]
@@ -705,7 +1040,45 @@ impl TestRig {
                     (ev.work_type() == beacon_processor::RPC_BLOBS).then_some(())
                 })
                 .unwrap_or_else(|e| panic!("Expected blobs work event: {e}")),
+            ResponseType::CustodyColumn => self
+                .pop_received_processor_event(|ev| {
+                    (ev.work_type() == beacon_processor::RPC_CUSTODY_COLUMN).then_some(())
+                })
+                .unwrap_or_else(|e| panic!("Expected column work event: {e}")),
         }
+    }
+
+    fn expect_rpc_custody_column_work_event(&mut self) {
+        self.pop_received_processor_event(|ev| {
+            if ev.work_type() == beacon_processor::RPC_CUSTODY_COLUMN {
+                Some(())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|e| panic!("Expected RPC custody column work: {e}"))
+    }
+
+    fn expect_rpc_sample_verify_work_event(&mut self) {
+        self.pop_received_processor_event(|ev| {
+            if ev.work_type() == beacon_processor::RPC_VERIFY_DATA_COLUMNS {
+                Some(())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|e| panic!("Expected sample verify work: {e}"))
+    }
+
+    fn expect_sampling_result_work(&mut self) {
+        self.pop_received_processor_event(|ev| {
+            if ev.work_type() == beacon_processor::SAMPLING_RESULT {
+                Some(())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|e| panic!("Expected sampling result work: {e}"))
     }
 
     fn expect_no_penalty_for(&mut self, peer_id: PeerId) {
@@ -743,7 +1116,11 @@ impl TestRig {
     fn expect_empty_network(&mut self) {
         self.drain_network_rx();
         if !self.network_rx_queue.is_empty() {
-            panic!("expected no network events: {:#?}", self.network_rx_queue);
+            let n = self.network_rx_queue.len();
+            panic!(
+                "expected no network events but got {n} events, displaying first 2: {:#?}",
+                self.network_rx_queue[..n.min(2)].iter().collect::<Vec<_>>()
+            );
         }
     }
 
@@ -1012,6 +1389,28 @@ fn test_single_block_lookup_failure() {
 }
 
 #[test]
+fn test_single_block_lookup_peer_disconnected_then_rpc_error() {
+    let mut rig = TestRig::test_setup();
+
+    let block_hash = Hash256::random();
+    let peer_id = rig.new_connected_peer();
+
+    // Trigger the request.
+    rig.trigger_unknown_block_from_attestation(block_hash, peer_id);
+    let id = rig.expect_block_lookup_request(block_hash);
+
+    // The peer disconnect event reaches sync before the rpc error.
+    rig.peer_disconnected(peer_id);
+    // The lookup is not removed as it can still potentially make progress.
+    rig.assert_single_lookups_count(1);
+    // The request fails.
+    rig.single_lookup_failed(id, peer_id, RPCError::Disconnected);
+    rig.expect_block_lookup_request(block_hash);
+    // The request should be removed from the network context on disconnection.
+    rig.expect_empty_network();
+}
+
+#[test]
 fn test_single_block_lookup_becomes_parent_request() {
     let mut rig = TestRig::test_setup();
 
@@ -1037,7 +1436,9 @@ fn test_single_block_lookup_becomes_parent_request() {
     // parent request after processing.
     rig.single_block_component_processed(
         id.lookup_id,
-        BlockError::ParentUnknown(RpcBlock::new_without_blobs(None, block)).into(),
+        BlockProcessingResult::Err(BlockError::ParentUnknown {
+            parent_root: block.parent_root(),
+        }),
     );
     assert_eq!(rig.active_single_lookups_count(), 2); // 2 = current + parent
     rig.expect_block_parent_request(parent_root);
@@ -1186,7 +1587,7 @@ fn test_parent_lookup_too_many_download_attempts_no_blacklist() {
     // Trigger the request
     rig.trigger_unknown_parent_block(peer_id, block.into());
     for i in 1..=PARENT_FAIL_TOLERANCE {
-        assert!(!rig.failed_chains_contains(&block_root));
+        rig.assert_not_failed_chain(block_root);
         let id = rig.expect_block_parent_request(parent_root);
         if i % 2 != 0 {
             // The request fails. It should be tried again.
@@ -1199,8 +1600,8 @@ fn test_parent_lookup_too_many_download_attempts_no_blacklist() {
         }
     }
 
-    assert!(!rig.failed_chains_contains(&block_root));
-    assert!(!rig.failed_chains_contains(&parent.canonical_root()));
+    rig.assert_not_failed_chain(block_root);
+    rig.assert_not_failed_chain(parent.canonical_root());
     rig.expect_no_active_lookups_empty_network();
 }
 
@@ -1238,7 +1639,7 @@ fn test_parent_lookup_too_many_processing_attempts_must_blacklist() {
 }
 
 #[test]
-fn test_parent_lookup_too_deep() {
+fn test_parent_lookup_too_deep_grow_ancestor() {
     let mut rig = TestRig::test_setup();
     let mut blocks = rig.rand_blockchain(PARENT_DEPTH_TOLERANCE);
 
@@ -1258,12 +1659,41 @@ fn test_parent_lookup_too_deep() {
         // the processing result
         rig.parent_block_processed(
             chain_hash,
-            BlockError::ParentUnknown(RpcBlock::new_without_blobs(None, block)).into(),
+            BlockProcessingResult::Err(BlockError::ParentUnknown {
+                parent_root: block.parent_root(),
+            }),
         )
     }
 
     rig.expect_penalty(peer_id, "chain_too_long");
-    assert!(rig.failed_chains_contains(&chain_hash));
+    rig.assert_failed_chain(chain_hash);
+}
+
+#[test]
+fn test_parent_lookup_too_deep_grow_tip() {
+    let mut rig = TestRig::test_setup();
+    let blocks = rig.rand_blockchain(PARENT_DEPTH_TOLERANCE - 1);
+    let peer_id = rig.new_connected_peer();
+    let tip = blocks.last().unwrap().clone();
+
+    for block in blocks.into_iter() {
+        let block_root = block.canonical_root();
+        rig.trigger_unknown_block_from_attestation(block_root, peer_id);
+        let id = rig.expect_block_parent_request(block_root);
+        rig.single_lookup_block_response(id, peer_id, Some(block.clone()));
+        rig.single_lookup_block_response(id, peer_id, None);
+        rig.expect_block_process(ResponseType::Block);
+        rig.single_block_component_processed(
+            id.lookup_id,
+            BlockError::ParentUnknown {
+                parent_root: block.parent_root(),
+            }
+            .into(),
+        );
+    }
+
+    rig.expect_penalty(peer_id, "chain_too_long");
+    rig.assert_failed_chain(tip.canonical_root());
 }
 
 #[test]
@@ -1274,19 +1704,9 @@ fn test_lookup_peer_disconnected_no_peers_left_while_request() {
     rig.trigger_unknown_parent_block(peer_id, trigger_block.into());
     rig.peer_disconnected(peer_id);
     rig.rpc_error_all_active_requests(peer_id);
-    rig.expect_no_active_lookups();
-}
-
-#[test]
-fn test_lookup_peer_disconnected_no_peers_left_not_while_request() {
-    let mut rig = TestRig::test_setup();
-    let peer_id = rig.new_connected_peer();
-    let trigger_block = rig.rand_block();
-    rig.trigger_unknown_parent_block(peer_id, trigger_block.into());
-    rig.peer_disconnected(peer_id);
-    // Note: this test case may be removed in the future. It's not strictly necessary to drop a
-    // lookup if there are no peers left. Lookup should only be dropped if it can not make progress
-    rig.expect_no_active_lookups();
+    // Erroring all rpc requests and disconnecting the peer shouldn't remove the requests
+    // from the lookups map as they can still progress.
+    rig.assert_single_lookups_count(2);
 }
 
 #[test]
@@ -1303,6 +1723,26 @@ fn test_lookup_disconnection_peer_left() {
     rig.peer_disconnected(disconnecting_peer);
     rig.rpc_error_all_active_requests(disconnecting_peer);
     rig.assert_single_lookups_count(1);
+}
+
+#[test]
+fn test_lookup_add_peers_to_parent() {
+    let mut r = TestRig::test_setup();
+    let peer_id_1 = r.new_connected_peer();
+    let peer_id_2 = r.new_connected_peer();
+    let blocks = r.rand_blockchain(5);
+    let last_block_root = blocks.last().unwrap().canonical_root();
+    // Create a chain of lookups
+    for block in &blocks {
+        r.trigger_unknown_parent_block(peer_id_1, block.clone());
+    }
+    r.trigger_unknown_block_from_attestation(last_block_root, peer_id_2);
+    for block in blocks.iter().take(blocks.len() - 1) {
+        // Parent has the original unknown parent event peer + new peer
+        r.assert_lookup_peers(block.canonical_root(), vec![peer_id_1, peer_id_2]);
+    }
+    // Child lookup only has the unknown attestation peer
+    r.assert_lookup_peers(last_block_root, vec![peer_id_2]);
 }
 
 #[test]
@@ -1403,7 +1843,9 @@ fn test_same_chain_race_condition() {
             rig.log(&format!("Block {i} ParentUnknown"));
             rig.parent_block_processed(
                 chain_hash,
-                BlockError::ParentUnknown(RpcBlock::new_without_blobs(None, block)).into(),
+                BlockProcessingResult::Err(BlockError::ParentUnknown {
+                    parent_root: block.parent_root(),
+                }),
             )
         }
     }
@@ -1512,6 +1954,95 @@ fn blobs_in_da_checker_skip_download() {
     r.expect_no_active_lookups();
 }
 
+#[test]
+fn sampling_happy_path() {
+    let Some(mut r) = TestRig::test_setup_after_peerdas() else {
+        return;
+    };
+    r.new_connected_peers_for_peerdas();
+    let (block, data_columns) = r.rand_block_and_data_columns();
+    let block_root = block.canonical_root();
+    r.trigger_sample_block(block_root, block.slot());
+    // Retrieve all outgoing sample requests for random column indexes
+    let sampling_ids =
+        r.expect_only_data_columns_by_root_requests(block_root, SAMPLING_REQUIRED_SUCCESSES);
+    // Resolve all of them one by one
+    r.complete_valid_sampling_column_requests(sampling_ids, data_columns);
+    r.expect_clean_finished_sampling();
+}
+
+#[test]
+#[ignore] // Ignoring due to flakiness https://github.com/sigp/lighthouse/issues/6319
+fn sampling_with_retries() {
+    let Some(mut r) = TestRig::test_setup_after_peerdas() else {
+        return;
+    };
+    r.new_connected_peers_for_peerdas();
+    let (block, data_columns) = r.rand_block_and_data_columns();
+    let block_root = block.canonical_root();
+    r.trigger_sample_block(block_root, block.slot());
+    // Retrieve all outgoing sample requests for random column indexes, and return empty responses
+    let sampling_ids =
+        r.expect_only_data_columns_by_root_requests(block_root, SAMPLING_REQUIRED_SUCCESSES);
+    r.return_empty_sampling_requests(sampling_ids);
+    // Expect retries for all of them, and resolve them
+    let sampling_ids =
+        r.expect_only_data_columns_by_root_requests(block_root, SAMPLING_REQUIRED_SUCCESSES);
+    r.complete_valid_sampling_column_requests(sampling_ids, data_columns);
+    r.expect_clean_finished_sampling();
+}
+
+#[test]
+fn sampling_avoid_retrying_same_peer() {
+    let Some(mut r) = TestRig::test_setup_after_peerdas() else {
+        return;
+    };
+    let peer_id_1 = r.new_connected_supernode_peer();
+    let peer_id_2 = r.new_connected_supernode_peer();
+    let block_root = Hash256::random();
+    r.trigger_sample_block(block_root, Slot::new(0));
+    // Retrieve all outgoing sample requests for random column indexes, and return empty responses
+    let sampling_ids =
+        r.expect_only_data_columns_by_root_requests(block_root, SAMPLING_REQUIRED_SUCCESSES);
+    r.sampling_requests_failed(sampling_ids, peer_id_1, RPCError::Disconnected);
+    // Should retry the other peer
+    let sampling_ids =
+        r.expect_only_data_columns_by_root_requests(block_root, SAMPLING_REQUIRED_SUCCESSES);
+    r.sampling_requests_failed(sampling_ids, peer_id_2, RPCError::Disconnected);
+    // Expect no more retries
+    r.expect_empty_network();
+}
+
+#[test]
+fn custody_lookup_happy_path() {
+    let Some(mut r) = TestRig::test_setup_after_peerdas() else {
+        return;
+    };
+    let spec = E::default_spec();
+    r.new_connected_peers_for_peerdas();
+    let (block, data_columns) = r.rand_block_and_data_columns();
+    let block_root = block.canonical_root();
+    let peer_id = r.new_connected_peer();
+    r.trigger_unknown_block_from_attestation(block_root, peer_id);
+    // Should not request blobs
+    let id = r.expect_block_lookup_request(block.canonical_root());
+    r.complete_valid_block_request(id, block.into(), true);
+    let custody_column_count = spec.custody_requirement * spec.data_columns_per_subnet() as u64;
+    let custody_ids =
+        r.expect_only_data_columns_by_root_requests(block_root, custody_column_count as usize);
+    r.complete_valid_custody_request(custody_ids, data_columns, false);
+    r.expect_no_active_lookups();
+}
+
+// TODO(das): Test retries of DataColumnByRoot:
+// - Expect request for column_index
+// - Respond with bad data
+// - Respond with stream terminator
+//   ^ The stream terminator should be ignored and not close the next retry
+
+// TODO(das): Test error early a sampling request and it getting drop + then receiving responses
+// from pending requests.
+
 mod deneb_only {
     use super::*;
     use beacon_chain::{
@@ -1604,7 +2135,7 @@ mod deneb_only {
                     RequestTrigger::GossipUnknownParentBlock { .. } => {
                         rig.send_sync_message(SyncMessage::UnknownParentBlock(
                             peer_id,
-                            RpcBlock::new_without_blobs(Some(block_root), block.clone()),
+                            block.clone(),
                             block_root,
                         ));
 
@@ -1886,7 +2417,9 @@ mod deneb_only {
             .unwrap();
             self.rig.parent_block_processed(
                 self.block_root,
-                BlockProcessingResult::Err(BlockError::ParentUnknown(block)),
+                BlockProcessingResult::Err(BlockError::ParentUnknown {
+                    parent_root: block.parent_root(),
+                }),
             );
             assert_eq!(self.rig.active_parent_lookups_count(), 1);
             self

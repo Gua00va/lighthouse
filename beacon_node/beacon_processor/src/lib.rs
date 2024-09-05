@@ -60,13 +60,15 @@ use std::time::Duration;
 use task_executor::TaskExecutor;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
-use types::{Attestation, Hash256, SignedAggregateAndProof, SubnetId};
+use types::{
+    Attestation, BeaconState, ChainSpec, Hash256, RelativeEpoch, SignedAggregateAndProof, SubnetId,
+};
 use types::{EthSpec, Slot};
-use work_reprocessing_queue::IgnoredRpcBlock;
 use work_reprocessing_queue::{
     spawn_reprocess_scheduler, QueuedAggregate, QueuedLightClientUpdate, QueuedRpcBlock,
     QueuedUnaggregate, ReadyWork,
 };
+use work_reprocessing_queue::{IgnoredRpcBlock, QueuedSamplingRequest};
 
 mod metrics;
 pub mod work_reprocessing_queue;
@@ -85,123 +87,114 @@ const MAX_IDLE_QUEUE_LEN: usize = 16_384;
 /// The maximum size of the channel for re-processing work events.
 const DEFAULT_MAX_SCHEDULED_WORK_QUEUE_LEN: usize = 3 * DEFAULT_MAX_WORK_EVENT_QUEUE_LEN / 4;
 
-/// The maximum number of queued `Attestation` objects that will be stored before we start dropping
-/// them.
-const MAX_UNAGGREGATED_ATTESTATION_QUEUE_LEN: usize = 16_384;
+/// Over-provision queues based on active validator count by some factor. The beacon chain has
+/// strict churns that prevent the validator set size from changing rapidly. By over-provisioning
+/// slightly, we don't need to adjust the queues during the lifetime of a process.
+const ACTIVE_VALIDATOR_COUNT_OVERPROVISION_PERCENT: usize = 110;
 
-/// The maximum number of queued `Attestation` objects that will be stored before we start dropping
-/// them.
-const MAX_UNAGGREGATED_ATTESTATION_REPROCESS_QUEUE_LEN: usize = 8_192;
+/// Maximum number of queued items that will be stored before dropping them
+pub struct BeaconProcessorQueueLengths {
+    aggregate_queue: usize,
+    attestation_queue: usize,
+    unknown_block_aggregate_queue: usize,
+    unknown_block_attestation_queue: usize,
+    sync_message_queue: usize,
+    sync_contribution_queue: usize,
+    gossip_voluntary_exit_queue: usize,
+    gossip_proposer_slashing_queue: usize,
+    gossip_attester_slashing_queue: usize,
+    finality_update_queue: usize,
+    optimistic_update_queue: usize,
+    unknown_light_client_update_queue: usize,
+    unknown_block_sampling_request_queue: usize,
+    rpc_block_queue: usize,
+    rpc_blob_queue: usize,
+    rpc_custody_column_queue: usize,
+    rpc_verify_data_column_queue: usize,
+    sampling_result_queue: usize,
+    chain_segment_queue: usize,
+    backfill_chain_segment: usize,
+    gossip_block_queue: usize,
+    gossip_blob_queue: usize,
+    gossip_data_column_queue: usize,
+    delayed_block_queue: usize,
+    status_queue: usize,
+    bbrange_queue: usize,
+    bbroots_queue: usize,
+    blbroots_queue: usize,
+    blbrange_queue: usize,
+    dcbroots_queue: usize,
+    dcbrange_queue: usize,
+    gossip_bls_to_execution_change_queue: usize,
+    lc_bootstrap_queue: usize,
+    lc_optimistic_update_queue: usize,
+    lc_finality_update_queue: usize,
+    api_request_p0_queue: usize,
+    api_request_p1_queue: usize,
+}
 
-/// The maximum number of queued `SignedAggregateAndProof` objects that will be stored before we
-/// start dropping them.
-const MAX_AGGREGATED_ATTESTATION_QUEUE_LEN: usize = 4_096;
+impl BeaconProcessorQueueLengths {
+    pub fn from_state<E: EthSpec>(
+        state: &BeaconState<E>,
+        spec: &ChainSpec,
+    ) -> Result<Self, String> {
+        let active_validator_count =
+            match state.get_cached_active_validator_indices(RelativeEpoch::Current) {
+                Ok(indices) => indices.len(),
+                Err(_) => state
+                    .get_active_validator_indices(state.current_epoch(), spec)
+                    .map_err(|e| format!("Error computing active indices: {:?}", e))?
+                    .len(),
+            };
+        let active_validator_count =
+            (ACTIVE_VALIDATOR_COUNT_OVERPROVISION_PERCENT * active_validator_count) / 100;
+        let slots_per_epoch = E::slots_per_epoch() as usize;
 
-/// The maximum number of queued `SignedAggregateAndProof` objects that will be stored before we
-/// start dropping them.
-const MAX_AGGREGATED_ATTESTATION_REPROCESS_QUEUE_LEN: usize = 1_024;
-
-/// The maximum number of queued `SignedBeaconBlock` objects received on gossip that will be stored
-/// before we start dropping them.
-const MAX_GOSSIP_BLOCK_QUEUE_LEN: usize = 1_024;
-
-/// The maximum number of queued `BlobSidecar` objects received on gossip that
-/// will be stored before we start dropping them.
-const MAX_GOSSIP_BLOB_QUEUE_LEN: usize = 1_024;
-
-/// The maximum number of queued `SignedBeaconBlock` objects received prior to their slot (but
-/// within acceptable clock disparity) that will be queued before we start dropping them.
-const MAX_DELAYED_BLOCK_QUEUE_LEN: usize = 1_024;
-
-/// The maximum number of queued `SignedVoluntaryExit` objects received on gossip that will be stored
-/// before we start dropping them.
-const MAX_GOSSIP_EXIT_QUEUE_LEN: usize = 4_096;
-
-/// The maximum number of queued `ProposerSlashing` objects received on gossip that will be stored
-/// before we start dropping them.
-const MAX_GOSSIP_PROPOSER_SLASHING_QUEUE_LEN: usize = 4_096;
-
-/// The maximum number of queued `AttesterSlashing` objects received on gossip that will be stored
-/// before we start dropping them.
-const MAX_GOSSIP_ATTESTER_SLASHING_QUEUE_LEN: usize = 4_096;
-
-/// The maximum number of queued `LightClientFinalityUpdate` objects received on gossip that will be stored
-/// before we start dropping them.
-const MAX_GOSSIP_FINALITY_UPDATE_QUEUE_LEN: usize = 1_024;
-
-/// The maximum number of queued `LightClientOptimisticUpdate` objects received on gossip that will be stored
-/// before we start dropping them.
-const MAX_GOSSIP_OPTIMISTIC_UPDATE_QUEUE_LEN: usize = 1_024;
-
-/// The maximum number of queued `LightClientOptimisticUpdate` objects received on gossip that will be stored
-/// for reprocessing before we start dropping them.
-const MAX_GOSSIP_OPTIMISTIC_UPDATE_REPROCESS_QUEUE_LEN: usize = 128;
-
-/// The maximum number of queued `SyncCommitteeMessage` objects that will be stored before we start dropping
-/// them.
-const MAX_SYNC_MESSAGE_QUEUE_LEN: usize = 2048;
-
-/// The maximum number of queued `SignedContributionAndProof` objects that will be stored before we
-/// start dropping them.
-const MAX_SYNC_CONTRIBUTION_QUEUE_LEN: usize = 1024;
-
-/// The maximum number of queued `SignedBeaconBlock` objects received from the network RPC that
-/// will be stored before we start dropping them.
-const MAX_RPC_BLOCK_QUEUE_LEN: usize = 1_024;
-
-/// The maximum number of queued `BlobSidecar` objects received from the network RPC that
-/// will be stored before we start dropping them.
-const MAX_RPC_BLOB_QUEUE_LEN: usize = 1_024;
-
-/// The maximum number of queued `Vec<SignedBeaconBlock>` objects received during syncing that will
-/// be stored before we start dropping them.
-const MAX_CHAIN_SEGMENT_QUEUE_LEN: usize = 64;
-
-/// The maximum number of queued `StatusMessage` objects received from the network RPC that will be
-/// stored before we start dropping them.
-const MAX_STATUS_QUEUE_LEN: usize = 1_024;
-
-/// The maximum number of queued `BlocksByRangeRequest` objects received from the network RPC that
-/// will be stored before we start dropping them.
-const MAX_BLOCKS_BY_RANGE_QUEUE_LEN: usize = 1_024;
-
-/// The maximum number of queued `BlobsByRangeRequest` objects received from the network RPC that
-/// will be stored before we start dropping them.
-const MAX_BLOBS_BY_RANGE_QUEUE_LEN: usize = 1024;
-
-/// The maximum number of queued `BlocksByRootRequest` objects received from the network RPC that
-/// will be stored before we start dropping them.
-const MAX_BLOCKS_BY_ROOTS_QUEUE_LEN: usize = 1_024;
-
-/// The maximum number of queued `BlobsByRootRequest` objects received from the network RPC that
-/// will be stored before we start dropping them.
-const MAX_BLOBS_BY_ROOTS_QUEUE_LEN: usize = 1_024;
-
-/// Maximum number of `SignedBlsToExecutionChange` messages to queue before dropping them.
-///
-/// This value is set high to accommodate the large spike that is expected immediately after Capella
-/// is activated.
-const MAX_BLS_TO_EXECUTION_CHANGE_QUEUE_LEN: usize = 16_384;
-
-/// The maximum number of queued `LightClientBootstrapRequest` objects received from the network RPC that
-/// will be stored before we start dropping them.
-const MAX_LIGHT_CLIENT_BOOTSTRAP_QUEUE_LEN: usize = 1_024;
-
-/// The maximum number of queued `LightClientOptimisticUpdateRequest` objects received from the network RPC that
-/// will be stored before we start dropping them.
-const MAX_LIGHT_CLIENT_OPTIMISTIC_UPDATE_QUEUE_LEN: usize = 512;
-
-/// The maximum number of queued `LightClientFinalityUpdateRequest` objects received from the network RPC that
-/// will be stored before we start dropping them.
-const MAX_LIGHT_CLIENT_FINALITY_UPDATE_QUEUE_LEN: usize = 512;
-
-/// The maximum number of priority-0 (highest priority) messages that will be queued before
-/// they begin to be dropped.
-const MAX_API_REQUEST_P0_QUEUE_LEN: usize = 1_024;
-
-/// The maximum number of priority-1 (second-highest priority) messages that will be queued before
-/// they begin to be dropped.
-const MAX_API_REQUEST_P1_QUEUE_LEN: usize = 1_024;
+        Ok(Self {
+            aggregate_queue: 4096,
+            unknown_block_aggregate_queue: 1024,
+            // Capacity for a full slot's worth of attestations if subscribed to all subnets
+            attestation_queue: active_validator_count / slots_per_epoch,
+            // Capacity for a full slot's worth of attestations if subscribed to all subnets
+            unknown_block_attestation_queue: active_validator_count / slots_per_epoch,
+            sync_message_queue: 2048,
+            sync_contribution_queue: 1024,
+            gossip_voluntary_exit_queue: 4096,
+            gossip_proposer_slashing_queue: 4096,
+            gossip_attester_slashing_queue: 4096,
+            finality_update_queue: 1024,
+            optimistic_update_queue: 1024,
+            unknown_block_sampling_request_queue: 16384,
+            unknown_light_client_update_queue: 128,
+            rpc_block_queue: 1024,
+            rpc_blob_queue: 1024,
+            // TODO(das): Placeholder values
+            rpc_custody_column_queue: 1000,
+            rpc_verify_data_column_queue: 1000,
+            sampling_result_queue: 1000,
+            chain_segment_queue: 64,
+            backfill_chain_segment: 64,
+            gossip_block_queue: 1024,
+            gossip_blob_queue: 1024,
+            gossip_data_column_queue: 1024,
+            delayed_block_queue: 1024,
+            status_queue: 1024,
+            bbrange_queue: 1024,
+            bbroots_queue: 1024,
+            blbroots_queue: 1024,
+            blbrange_queue: 1024,
+            // TODO(das): pick proper values
+            dcbroots_queue: 1024,
+            dcbrange_queue: 1024,
+            gossip_bls_to_execution_change_queue: 16384,
+            lc_bootstrap_queue: 1024,
+            lc_optimistic_update_queue: 512,
+            lc_finality_update_queue: 512,
+            api_request_p0_queue: 1024,
+            api_request_p1_queue: 1024,
+        })
+    }
+}
 
 /// The name of the manager tokio task.
 const MANAGER_TASK_NAME: &str = "beacon_processor_manager";
@@ -232,6 +225,7 @@ pub const GOSSIP_AGGREGATE: &str = "gossip_aggregate";
 pub const GOSSIP_AGGREGATE_BATCH: &str = "gossip_aggregate_batch";
 pub const GOSSIP_BLOCK: &str = "gossip_block";
 pub const GOSSIP_BLOBS_SIDECAR: &str = "gossip_blobs_sidecar";
+pub const GOSSIP_BLOBS_COLUMN_SIDECAR: &str = "gossip_blobs_column_sidecar";
 pub const DELAYED_IMPORT_BLOCK: &str = "delayed_import_block";
 pub const GOSSIP_VOLUNTARY_EXIT: &str = "gossip_voluntary_exit";
 pub const GOSSIP_PROPOSER_SLASHING: &str = "gossip_proposer_slashing";
@@ -243,6 +237,9 @@ pub const GOSSIP_LIGHT_CLIENT_OPTIMISTIC_UPDATE: &str = "light_client_optimistic
 pub const RPC_BLOCK: &str = "rpc_block";
 pub const IGNORED_RPC_BLOCK: &str = "ignored_rpc_block";
 pub const RPC_BLOBS: &str = "rpc_blob";
+pub const RPC_CUSTODY_COLUMN: &str = "rpc_custody_column";
+pub const RPC_VERIFY_DATA_COLUMNS: &str = "rpc_verify_data_columns";
+pub const SAMPLING_RESULT: &str = "sampling_result";
 pub const CHAIN_SEGMENT: &str = "chain_segment";
 pub const CHAIN_SEGMENT_BACKFILL: &str = "chain_segment_backfill";
 pub const STATUS_PROCESSING: &str = "status_processing";
@@ -250,12 +247,15 @@ pub const BLOCKS_BY_RANGE_REQUEST: &str = "blocks_by_range_request";
 pub const BLOCKS_BY_ROOTS_REQUEST: &str = "blocks_by_roots_request";
 pub const BLOBS_BY_RANGE_REQUEST: &str = "blobs_by_range_request";
 pub const BLOBS_BY_ROOTS_REQUEST: &str = "blobs_by_roots_request";
+pub const DATA_COLUMNS_BY_ROOTS_REQUEST: &str = "data_columns_by_roots_request";
+pub const DATA_COLUMNS_BY_RANGE_REQUEST: &str = "data_columns_by_range_request";
 pub const LIGHT_CLIENT_BOOTSTRAP_REQUEST: &str = "light_client_bootstrap";
 pub const LIGHT_CLIENT_FINALITY_UPDATE_REQUEST: &str = "light_client_finality_update_request";
 pub const LIGHT_CLIENT_OPTIMISTIC_UPDATE_REQUEST: &str = "light_client_optimistic_update_request";
 pub const UNKNOWN_BLOCK_ATTESTATION: &str = "unknown_block_attestation";
 pub const UNKNOWN_BLOCK_AGGREGATE: &str = "unknown_block_aggregate";
 pub const UNKNOWN_LIGHT_CLIENT_UPDATE: &str = "unknown_light_client_update";
+pub const UNKNOWN_BLOCK_SAMPLING_REQUEST: &str = "unknown_block_sampling_request";
 pub const GOSSIP_BLS_TO_EXECUTION_CHANGE: &str = "gossip_bls_to_execution_change";
 pub const API_REQUEST_P0: &str = "api_request_p0";
 pub const API_REQUEST_P1: &str = "api_request_p1";
@@ -511,6 +511,10 @@ impl<E: EthSpec> From<ReadyWork> for WorkEvent<E> {
                     process_fn,
                 },
             },
+            ReadyWork::SamplingRequest(QueuedSamplingRequest { process_fn, .. }) => Self {
+                drop_during_sync: true,
+                work: Work::UnknownBlockSamplingRequest { process_fn },
+            },
             ReadyWork::BackfillSync(QueuedBackfillBatch(process_fn)) => Self {
                 drop_during_sync: false,
                 work: Work::ChainSegmentBackfill(process_fn),
@@ -594,12 +598,16 @@ pub enum Work<E: EthSpec> {
         parent_root: Hash256,
         process_fn: BlockingFn,
     },
+    UnknownBlockSamplingRequest {
+        process_fn: BlockingFn,
+    },
     GossipAggregateBatch {
         aggregates: Vec<GossipAggregatePackage<E>>,
         process_batch: Box<dyn FnOnce(Vec<GossipAggregatePackage<E>>) + Send + Sync>,
     },
     GossipBlock(AsyncFn),
     GossipBlobSidecar(AsyncFn),
+    GossipDataColumnSidecar(AsyncFn),
     DelayedImportBlock {
         beacon_block_slot: Slot,
         beacon_block_root: Hash256,
@@ -618,6 +626,9 @@ pub enum Work<E: EthSpec> {
     RpcBlobs {
         process_fn: AsyncFn,
     },
+    RpcCustodyColumn(AsyncFn),
+    RpcVerifyDataColumn(AsyncFn),
+    SamplingResult(AsyncFn),
     IgnoredRpcBlock {
         process_fn: BlockingFn,
     },
@@ -628,6 +639,8 @@ pub enum Work<E: EthSpec> {
     BlocksByRootsRequest(AsyncFn),
     BlobsByRangeRequest(BlockingFn),
     BlobsByRootsRequest(BlockingFn),
+    DataColumnsByRootsRequest(BlockingFn),
+    DataColumnsByRangeRequest(BlockingFn),
     GossipBlsToExecutionChange(BlockingFn),
     LightClientBootstrapRequest(BlockingFn),
     LightClientOptimisticUpdateRequest(BlockingFn),
@@ -652,6 +665,7 @@ impl<E: EthSpec> Work<E> {
             Work::GossipAggregateBatch { .. } => GOSSIP_AGGREGATE_BATCH,
             Work::GossipBlock(_) => GOSSIP_BLOCK,
             Work::GossipBlobSidecar(_) => GOSSIP_BLOBS_SIDECAR,
+            Work::GossipDataColumnSidecar(_) => GOSSIP_BLOBS_COLUMN_SIDECAR,
             Work::DelayedImportBlock { .. } => DELAYED_IMPORT_BLOCK,
             Work::GossipVoluntaryExit(_) => GOSSIP_VOLUNTARY_EXIT,
             Work::GossipProposerSlashing(_) => GOSSIP_PROPOSER_SLASHING,
@@ -662,6 +676,9 @@ impl<E: EthSpec> Work<E> {
             Work::GossipLightClientOptimisticUpdate(_) => GOSSIP_LIGHT_CLIENT_OPTIMISTIC_UPDATE,
             Work::RpcBlock { .. } => RPC_BLOCK,
             Work::RpcBlobs { .. } => RPC_BLOBS,
+            Work::RpcCustodyColumn { .. } => RPC_CUSTODY_COLUMN,
+            Work::RpcVerifyDataColumn(_) => RPC_VERIFY_DATA_COLUMNS,
+            Work::SamplingResult(_) => SAMPLING_RESULT,
             Work::IgnoredRpcBlock { .. } => IGNORED_RPC_BLOCK,
             Work::ChainSegment { .. } => CHAIN_SEGMENT,
             Work::ChainSegmentBackfill(_) => CHAIN_SEGMENT_BACKFILL,
@@ -670,13 +687,16 @@ impl<E: EthSpec> Work<E> {
             Work::BlocksByRootsRequest(_) => BLOCKS_BY_ROOTS_REQUEST,
             Work::BlobsByRangeRequest(_) => BLOBS_BY_RANGE_REQUEST,
             Work::BlobsByRootsRequest(_) => BLOBS_BY_ROOTS_REQUEST,
+            Work::DataColumnsByRootsRequest(_) => DATA_COLUMNS_BY_ROOTS_REQUEST,
+            Work::DataColumnsByRangeRequest(_) => DATA_COLUMNS_BY_RANGE_REQUEST,
             Work::LightClientBootstrapRequest(_) => LIGHT_CLIENT_BOOTSTRAP_REQUEST,
             Work::LightClientOptimisticUpdateRequest(_) => LIGHT_CLIENT_OPTIMISTIC_UPDATE_REQUEST,
             Work::LightClientFinalityUpdateRequest(_) => LIGHT_CLIENT_FINALITY_UPDATE_REQUEST,
             Work::UnknownBlockAttestation { .. } => UNKNOWN_BLOCK_ATTESTATION,
             Work::UnknownBlockAggregate { .. } => UNKNOWN_BLOCK_AGGREGATE,
-            Work::GossipBlsToExecutionChange(_) => GOSSIP_BLS_TO_EXECUTION_CHANGE,
             Work::UnknownLightClientOptimisticUpdate { .. } => UNKNOWN_LIGHT_CLIENT_UPDATE,
+            Work::UnknownBlockSamplingRequest { .. } => UNKNOWN_BLOCK_SAMPLING_REQUEST,
+            Work::GossipBlsToExecutionChange(_) => GOSSIP_BLS_TO_EXECUTION_CHANGE,
             Work::ApiRequestP0 { .. } => API_REQUEST_P0,
             Work::ApiRequestP1 { .. } => API_REQUEST_P1,
         }
@@ -772,6 +792,7 @@ impl<E: EthSpec> BeaconProcessor<E> {
     ///
     /// The optional `work_journal_tx` allows for an outside process to receive a log of all work
     /// events processed by `self`. This should only be used during testing.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_manager<S: SlotClock + 'static>(
         mut self,
         event_rx: mpsc::Receiver<WorkEvent<E>>,
@@ -780,6 +801,7 @@ impl<E: EthSpec> BeaconProcessor<E> {
         work_journal_tx: Option<mpsc::Sender<&'static str>>,
         slot_clock: S,
         maximum_gossip_clock_disparity: Duration,
+        queue_lengths: BeaconProcessorQueueLengths,
     ) -> Result<(), String> {
         // Used by workers to communicate that they are finished a task.
         let (idle_tx, idle_rx) = mpsc::channel::<()>(MAX_IDLE_QUEUE_LEN);
@@ -787,61 +809,70 @@ impl<E: EthSpec> BeaconProcessor<E> {
         // Using LIFO queues for attestations since validator profits rely upon getting fresh
         // attestations into blocks. Additionally, later attestations contain more information than
         // earlier ones, so we consider them more valuable.
-        let mut aggregate_queue = LifoQueue::new(MAX_AGGREGATED_ATTESTATION_QUEUE_LEN);
+        let mut aggregate_queue = LifoQueue::new(queue_lengths.aggregate_queue);
         let mut aggregate_debounce = TimeLatch::default();
-        let mut attestation_queue = LifoQueue::new(MAX_UNAGGREGATED_ATTESTATION_QUEUE_LEN);
+        let mut attestation_queue = LifoQueue::new(queue_lengths.attestation_queue);
         let mut attestation_debounce = TimeLatch::default();
         let mut unknown_block_aggregate_queue =
-            LifoQueue::new(MAX_AGGREGATED_ATTESTATION_REPROCESS_QUEUE_LEN);
+            LifoQueue::new(queue_lengths.unknown_block_aggregate_queue);
         let mut unknown_block_attestation_queue =
-            LifoQueue::new(MAX_UNAGGREGATED_ATTESTATION_REPROCESS_QUEUE_LEN);
+            LifoQueue::new(queue_lengths.unknown_block_attestation_queue);
 
-        let mut sync_message_queue = LifoQueue::new(MAX_SYNC_MESSAGE_QUEUE_LEN);
-        let mut sync_contribution_queue = LifoQueue::new(MAX_SYNC_CONTRIBUTION_QUEUE_LEN);
+        let mut sync_message_queue = LifoQueue::new(queue_lengths.sync_message_queue);
+        let mut sync_contribution_queue = LifoQueue::new(queue_lengths.sync_contribution_queue);
 
         // Using a FIFO queue for voluntary exits since it prevents exit censoring. I don't have
         // a strong feeling about queue type for exits.
-        let mut gossip_voluntary_exit_queue = FifoQueue::new(MAX_GOSSIP_EXIT_QUEUE_LEN);
+        let mut gossip_voluntary_exit_queue =
+            FifoQueue::new(queue_lengths.gossip_voluntary_exit_queue);
 
         // Using a FIFO queue for slashing to prevent people from flushing their slashings from the
         // queues with lots of junk messages.
         let mut gossip_proposer_slashing_queue =
-            FifoQueue::new(MAX_GOSSIP_PROPOSER_SLASHING_QUEUE_LEN);
+            FifoQueue::new(queue_lengths.gossip_proposer_slashing_queue);
         let mut gossip_attester_slashing_queue =
-            FifoQueue::new(MAX_GOSSIP_ATTESTER_SLASHING_QUEUE_LEN);
+            FifoQueue::new(queue_lengths.gossip_attester_slashing_queue);
 
         // Using a FIFO queue for light client updates to maintain sequence order.
-        let mut finality_update_queue = FifoQueue::new(MAX_GOSSIP_FINALITY_UPDATE_QUEUE_LEN);
-        let mut optimistic_update_queue = FifoQueue::new(MAX_GOSSIP_OPTIMISTIC_UPDATE_QUEUE_LEN);
+        let mut finality_update_queue = FifoQueue::new(queue_lengths.finality_update_queue);
+        let mut optimistic_update_queue = FifoQueue::new(queue_lengths.optimistic_update_queue);
         let mut unknown_light_client_update_queue =
-            FifoQueue::new(MAX_GOSSIP_OPTIMISTIC_UPDATE_REPROCESS_QUEUE_LEN);
+            FifoQueue::new(queue_lengths.unknown_light_client_update_queue);
+        let mut unknown_block_sampling_request_queue =
+            FifoQueue::new(queue_lengths.unknown_block_sampling_request_queue);
 
         // Using a FIFO queue since blocks need to be imported sequentially.
-        let mut rpc_block_queue = FifoQueue::new(MAX_RPC_BLOCK_QUEUE_LEN);
-        let mut rpc_blob_queue = FifoQueue::new(MAX_RPC_BLOB_QUEUE_LEN);
-        let mut chain_segment_queue = FifoQueue::new(MAX_CHAIN_SEGMENT_QUEUE_LEN);
-        let mut backfill_chain_segment = FifoQueue::new(MAX_CHAIN_SEGMENT_QUEUE_LEN);
-        let mut gossip_block_queue = FifoQueue::new(MAX_GOSSIP_BLOCK_QUEUE_LEN);
-        let mut gossip_blob_queue = FifoQueue::new(MAX_GOSSIP_BLOB_QUEUE_LEN);
-        let mut delayed_block_queue = FifoQueue::new(MAX_DELAYED_BLOCK_QUEUE_LEN);
+        let mut rpc_block_queue = FifoQueue::new(queue_lengths.rpc_block_queue);
+        let mut rpc_blob_queue = FifoQueue::new(queue_lengths.rpc_blob_queue);
+        let mut rpc_custody_column_queue = FifoQueue::new(queue_lengths.rpc_custody_column_queue);
+        let mut rpc_verify_data_column_queue =
+            FifoQueue::new(queue_lengths.rpc_verify_data_column_queue);
+        let mut sampling_result_queue = FifoQueue::new(queue_lengths.sampling_result_queue);
+        let mut chain_segment_queue = FifoQueue::new(queue_lengths.chain_segment_queue);
+        let mut backfill_chain_segment = FifoQueue::new(queue_lengths.backfill_chain_segment);
+        let mut gossip_block_queue = FifoQueue::new(queue_lengths.gossip_block_queue);
+        let mut gossip_blob_queue = FifoQueue::new(queue_lengths.gossip_blob_queue);
+        let mut gossip_data_column_queue = FifoQueue::new(queue_lengths.gossip_data_column_queue);
+        let mut delayed_block_queue = FifoQueue::new(queue_lengths.delayed_block_queue);
 
-        let mut status_queue = FifoQueue::new(MAX_STATUS_QUEUE_LEN);
-        let mut bbrange_queue = FifoQueue::new(MAX_BLOCKS_BY_RANGE_QUEUE_LEN);
-        let mut bbroots_queue = FifoQueue::new(MAX_BLOCKS_BY_ROOTS_QUEUE_LEN);
-        let mut blbroots_queue = FifoQueue::new(MAX_BLOBS_BY_ROOTS_QUEUE_LEN);
-        let mut blbrange_queue = FifoQueue::new(MAX_BLOBS_BY_RANGE_QUEUE_LEN);
+        let mut status_queue = FifoQueue::new(queue_lengths.status_queue);
+        let mut bbrange_queue = FifoQueue::new(queue_lengths.bbrange_queue);
+        let mut bbroots_queue = FifoQueue::new(queue_lengths.bbroots_queue);
+        let mut blbroots_queue = FifoQueue::new(queue_lengths.blbroots_queue);
+        let mut blbrange_queue = FifoQueue::new(queue_lengths.blbrange_queue);
+        let mut dcbroots_queue = FifoQueue::new(queue_lengths.dcbroots_queue);
+        let mut dcbrange_queue = FifoQueue::new(queue_lengths.dcbrange_queue);
 
         let mut gossip_bls_to_execution_change_queue =
-            FifoQueue::new(MAX_BLS_TO_EXECUTION_CHANGE_QUEUE_LEN);
+            FifoQueue::new(queue_lengths.gossip_bls_to_execution_change_queue);
 
-        let mut lc_bootstrap_queue = FifoQueue::new(MAX_LIGHT_CLIENT_BOOTSTRAP_QUEUE_LEN);
+        let mut lc_bootstrap_queue = FifoQueue::new(queue_lengths.lc_bootstrap_queue);
         let mut lc_optimistic_update_queue =
-            FifoQueue::new(MAX_LIGHT_CLIENT_OPTIMISTIC_UPDATE_QUEUE_LEN);
-        let mut lc_finality_update_queue =
-            FifoQueue::new(MAX_LIGHT_CLIENT_FINALITY_UPDATE_QUEUE_LEN);
+            FifoQueue::new(queue_lengths.lc_optimistic_update_queue);
+        let mut lc_finality_update_queue = FifoQueue::new(queue_lengths.lc_finality_update_queue);
 
-        let mut api_request_p0_queue = FifoQueue::new(MAX_API_REQUEST_P0_QUEUE_LEN);
-        let mut api_request_p1_queue = FifoQueue::new(MAX_API_REQUEST_P1_QUEUE_LEN);
+        let mut api_request_p0_queue = FifoQueue::new(queue_lengths.api_request_p0_queue);
+        let mut api_request_p1_queue = FifoQueue::new(queue_lengths.api_request_p1_queue);
 
         // Channels for sending work to the re-process scheduler (`work_reprocessing_tx`) and to
         // receive them back once they are ready (`ready_work_rx`).
@@ -972,6 +1003,15 @@ impl<E: EthSpec> BeaconProcessor<E> {
                             self.spawn_worker(item, idle_tx);
                         } else if let Some(item) = rpc_blob_queue.pop() {
                             self.spawn_worker(item, idle_tx);
+                        } else if let Some(item) = rpc_custody_column_queue.pop() {
+                            self.spawn_worker(item, idle_tx);
+                        // TODO(das): decide proper prioritization for sampling columns
+                        } else if let Some(item) = rpc_custody_column_queue.pop() {
+                            self.spawn_worker(item, idle_tx);
+                        } else if let Some(item) = rpc_verify_data_column_queue.pop() {
+                            self.spawn_worker(item, idle_tx);
+                        } else if let Some(item) = sampling_result_queue.pop() {
+                            self.spawn_worker(item, idle_tx);
                         // Check delayed blocks before gossip blocks, the gossip blocks might rely
                         // on the delayed ones.
                         } else if let Some(item) = delayed_block_queue.pop() {
@@ -981,6 +1021,8 @@ impl<E: EthSpec> BeaconProcessor<E> {
                         } else if let Some(item) = gossip_block_queue.pop() {
                             self.spawn_worker(item, idle_tx);
                         } else if let Some(item) = gossip_blob_queue.pop() {
+                            self.spawn_worker(item, idle_tx);
+                        } else if let Some(item) = gossip_data_column_queue.pop() {
                             self.spawn_worker(item, idle_tx);
                         // Check the priority 0 API requests after blocks and blobs, but before attestations.
                         } else if let Some(item) = api_request_p0_queue.pop() {
@@ -1131,6 +1173,13 @@ impl<E: EthSpec> BeaconProcessor<E> {
                             self.spawn_worker(item, idle_tx);
                         } else if let Some(item) = blbroots_queue.pop() {
                             self.spawn_worker(item, idle_tx);
+                        } else if let Some(item) = dcbroots_queue.pop() {
+                            self.spawn_worker(item, idle_tx);
+                        } else if let Some(item) = dcbrange_queue.pop() {
+                            self.spawn_worker(item, idle_tx);
+                        // Prioritize sampling requests after block syncing requests
+                        } else if let Some(item) = unknown_block_sampling_request_queue.pop() {
+                            self.spawn_worker(item, idle_tx);
                         // Check slashings after all other consensus messages so we prioritize
                         // following head.
                         //
@@ -1229,6 +1278,9 @@ impl<E: EthSpec> BeaconProcessor<E> {
                             Work::GossipBlobSidecar { .. } => {
                                 gossip_blob_queue.push(work, work_id, &self.log)
                             }
+                            Work::GossipDataColumnSidecar { .. } => {
+                                gossip_data_column_queue.push(work, work_id, &self.log)
+                            }
                             Work::DelayedImportBlock { .. } => {
                                 delayed_block_queue.push(work, work_id, &self.log)
                             }
@@ -1255,6 +1307,15 @@ impl<E: EthSpec> BeaconProcessor<E> {
                                 rpc_block_queue.push(work, work_id, &self.log)
                             }
                             Work::RpcBlobs { .. } => rpc_blob_queue.push(work, work_id, &self.log),
+                            Work::RpcCustodyColumn { .. } => {
+                                rpc_custody_column_queue.push(work, work_id, &self.log)
+                            }
+                            Work::RpcVerifyDataColumn(_) => {
+                                rpc_verify_data_column_queue.push(work, work_id, &self.log)
+                            }
+                            Work::SamplingResult(_) => {
+                                sampling_result_queue.push(work, work_id, &self.log)
+                            }
                             Work::ChainSegment { .. } => {
                                 chain_segment_queue.push(work, work_id, &self.log)
                             }
@@ -1292,8 +1353,17 @@ impl<E: EthSpec> BeaconProcessor<E> {
                             Work::BlobsByRootsRequest { .. } => {
                                 blbroots_queue.push(work, work_id, &self.log)
                             }
+                            Work::DataColumnsByRootsRequest { .. } => {
+                                dcbroots_queue.push(work, work_id, &self.log)
+                            }
+                            Work::DataColumnsByRangeRequest { .. } => {
+                                dcbrange_queue.push(work, work_id, &self.log)
+                            }
                             Work::UnknownLightClientOptimisticUpdate { .. } => {
                                 unknown_light_client_update_queue.push(work, work_id, &self.log)
+                            }
+                            Work::UnknownBlockSamplingRequest { .. } => {
+                                unknown_block_sampling_request_queue.push(work, work_id, &self.log)
                             }
                             Work::ApiRequestP0 { .. } => {
                                 api_request_p0_queue.push(work, work_id, &self.log)
@@ -1334,12 +1404,28 @@ impl<E: EthSpec> BeaconProcessor<E> {
                     gossip_blob_queue.len() as i64,
                 );
                 metrics::set_gauge(
+                    &metrics::BEACON_PROCESSOR_GOSSIP_DATA_COLUMN_QUEUE_TOTAL,
+                    gossip_data_column_queue.len() as i64,
+                );
+                metrics::set_gauge(
                     &metrics::BEACON_PROCESSOR_RPC_BLOCK_QUEUE_TOTAL,
                     rpc_block_queue.len() as i64,
                 );
                 metrics::set_gauge(
                     &metrics::BEACON_PROCESSOR_RPC_BLOB_QUEUE_TOTAL,
                     rpc_blob_queue.len() as i64,
+                );
+                metrics::set_gauge(
+                    &metrics::BEACON_PROCESSOR_RPC_CUSTODY_COLUMN_QUEUE_TOTAL,
+                    rpc_custody_column_queue.len() as i64,
+                );
+                metrics::set_gauge(
+                    &metrics::BEACON_PROCESSOR_RPC_VERIFY_DATA_COLUMN_QUEUE_TOTAL,
+                    rpc_verify_data_column_queue.len() as i64,
+                );
+                metrics::set_gauge(
+                    &metrics::BEACON_PROCESSOR_SAMPLING_RESULT_QUEUE_TOTAL,
+                    sampling_result_queue.len() as i64,
                 );
                 metrics::set_gauge(
                     &metrics::BEACON_PROCESSOR_CHAIN_SEGMENT_QUEUE_TOTAL,
@@ -1469,27 +1555,32 @@ impl<E: EthSpec> BeaconProcessor<E> {
             Work::ChainSegment(process_fn) => task_spawner.spawn_async(async move {
                 process_fn.await;
             }),
-            Work::UnknownBlockAttestation { process_fn } => task_spawner.spawn_blocking(process_fn),
-            Work::UnknownBlockAggregate { process_fn } => task_spawner.spawn_blocking(process_fn),
-            Work::UnknownLightClientOptimisticUpdate {
-                parent_root: _,
-                process_fn,
-            } => task_spawner.spawn_blocking(process_fn),
+            Work::UnknownBlockAttestation { process_fn }
+            | Work::UnknownBlockAggregate { process_fn }
+            | Work::UnknownLightClientOptimisticUpdate { process_fn, .. }
+            | Work::UnknownBlockSamplingRequest { process_fn } => {
+                task_spawner.spawn_blocking(process_fn)
+            }
             Work::DelayedImportBlock {
                 beacon_block_slot: _,
                 beacon_block_root: _,
                 process_fn,
             } => task_spawner.spawn_async(process_fn),
-            Work::RpcBlock { process_fn } | Work::RpcBlobs { process_fn } => {
-                task_spawner.spawn_async(process_fn)
-            }
+            Work::RpcBlock { process_fn }
+            | Work::RpcBlobs { process_fn }
+            | Work::RpcCustodyColumn(process_fn)
+            | Work::RpcVerifyDataColumn(process_fn)
+            | Work::SamplingResult(process_fn) => task_spawner.spawn_async(process_fn),
             Work::IgnoredRpcBlock { process_fn } => task_spawner.spawn_blocking(process_fn),
-            Work::GossipBlock(work) | Work::GossipBlobSidecar(work) => {
-                task_spawner.spawn_async(async move {
-                    work.await;
-                })
-            }
-            Work::BlobsByRangeRequest(process_fn) | Work::BlobsByRootsRequest(process_fn) => {
+            Work::GossipBlock(work)
+            | Work::GossipBlobSidecar(work)
+            | Work::GossipDataColumnSidecar(work) => task_spawner.spawn_async(async move {
+                work.await;
+            }),
+            Work::BlobsByRangeRequest(process_fn)
+            | Work::BlobsByRootsRequest(process_fn)
+            | Work::DataColumnsByRootsRequest(process_fn)
+            | Work::DataColumnsByRangeRequest(process_fn) => {
                 task_spawner.spawn_blocking(process_fn)
             }
             Work::BlocksByRangeRequest(work) | Work::BlocksByRootsRequest(work) => {

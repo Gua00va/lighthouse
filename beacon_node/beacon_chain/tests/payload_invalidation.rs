@@ -25,7 +25,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use task_executor::ShutdownReason;
-use tree_hash::TreeHash;
 use types::*;
 
 const VALIDATOR_COUNT: usize = 32;
@@ -213,7 +212,7 @@ impl InvalidPayloadRig {
             .unwrap();
     }
 
-    async fn import_block_parametric<F: Fn(&BlockError<E>) -> bool>(
+    async fn import_block_parametric<F: Fn(&BlockError) -> bool>(
         &mut self,
         new_payload_response: Payload,
         forkchoice_response: Payload,
@@ -1193,15 +1192,23 @@ async fn attesting_to_optimistic_head() {
             .produce_unaggregated_attestation(Slot::new(0), 0)
             .unwrap();
 
-        attestation.aggregation_bits.set(0, true).unwrap();
-        attestation.data.slot = slot;
-        attestation.data.beacon_block_root = root;
+        match &mut attestation {
+            Attestation::Base(ref mut att) => {
+                att.aggregation_bits.set(0, true).unwrap();
+            }
+            Attestation::Electra(ref mut att) => {
+                att.aggregation_bits.set(0, true).unwrap();
+            }
+        }
+
+        attestation.data_mut().slot = slot;
+        attestation.data_mut().beacon_block_root = root;
 
         rig.harness
             .chain
             .naive_aggregation_pool
             .write()
-            .insert(&attestation)
+            .insert(attestation.to_ref())
             .unwrap();
 
         attestation
@@ -1216,16 +1223,13 @@ async fn attesting_to_optimistic_head() {
     let get_aggregated = || {
         rig.harness
             .chain
-            .get_aggregated_attestation(&attestation.data)
+            .get_aggregated_attestation(attestation.to_ref())
     };
 
     let get_aggregated_by_slot_and_root = || {
         rig.harness
             .chain
-            .get_aggregated_attestation_by_slot_and_root(
-                attestation.data.slot,
-                &attestation.data.tree_hash_root(),
-            )
+            .get_aggregated_attestation(attestation.to_ref())
     };
 
     /*
@@ -1276,7 +1280,7 @@ struct OptimisticTransitionSetup {
 impl OptimisticTransitionSetup {
     async fn new(num_blocks: usize, ttd: u64) -> Self {
         let mut spec = E::default_spec();
-        spec.terminal_total_difficulty = ttd.into();
+        spec.terminal_total_difficulty = Uint256::from(ttd);
         let mut rig = InvalidPayloadRig::new_with_spec(spec).enable_attestations();
         rig.move_to_terminal_block();
 
@@ -1319,7 +1323,7 @@ async fn build_optimistic_chain(
     // Build a brand-new testing harness. We will apply the blocks from the previous harness to
     // this one.
     let mut spec = E::default_spec();
-    spec.terminal_total_difficulty = rig_ttd.into();
+    spec.terminal_total_difficulty = Uint256::from(rig_ttd);
     let rig = InvalidPayloadRig::new_with_spec(spec);
 
     let spec = &rig.harness.chain.spec;

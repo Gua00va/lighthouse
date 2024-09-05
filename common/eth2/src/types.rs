@@ -563,6 +563,7 @@ pub struct BlockHeaderData {
 pub struct DepositContractData {
     #[serde(with = "serde_utils::quoted_u64")]
     pub chain_id: u64,
+    #[serde(with = "serde_utils::address_hex")]
     pub address: Address,
 }
 
@@ -599,8 +600,8 @@ pub struct VersionData {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SyncingData {
     pub is_syncing: bool,
-    pub is_optimistic: Option<bool>,
-    pub el_offline: Option<bool>,
+    pub is_optimistic: bool,
+    pub el_offline: bool,
     pub head_slot: Slot,
     pub sync_distance: Slot,
 }
@@ -716,6 +717,21 @@ pub struct AttesterData {
     pub slot: Slot,
 }
 
+impl AttesterData {
+    pub fn match_attestation_data<E: EthSpec>(
+        &self,
+        attestation_data: &AttestationData,
+        spec: &ChainSpec,
+    ) -> bool {
+        if spec.fork_name_at_slot::<E>(attestation_data.slot) < ForkName::Electra {
+            self.slot == attestation_data.slot && self.committee_index == attestation_data.index
+        } else {
+            // After electra `attestation_data.index` is set to 0 and does not match the duties
+            self.slot == attestation_data.slot
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProposerData {
     pub pubkey: PublicKeyBytes,
@@ -765,6 +781,26 @@ pub struct ValidatorAttestationDataQuery {
 pub struct ValidatorAggregateAttestationQuery {
     pub attestation_data_root: Hash256,
     pub slot: Slot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub committee_index: Option<CommitteeIndex>,
+}
+
+#[derive(Clone, Deserialize)]
+pub struct LightClientUpdatesQuery {
+    pub start_period: u64,
+    pub count: u64,
+}
+
+#[derive(Encode, Decode)]
+pub struct LightClientUpdateSszResponse {
+    pub response_chunk_len: Vec<u8>,
+    pub response_chunk: Vec<u8>,
+}
+
+#[derive(Encode, Decode)]
+pub struct LightClientUpdateResponseChunk {
+    pub context: [u8; 4],
+    pub payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
@@ -954,6 +990,11 @@ pub struct SseHead {
     pub execution_optimistic: bool,
 }
 
+#[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
+pub struct BlockGossip {
+    pub slot: Slot,
+    pub block: Hash256,
+}
 #[derive(PartialEq, Debug, Serialize, Deserialize, Clone)]
 pub struct SseChainReorg {
     pub slot: Slot,
@@ -995,6 +1036,7 @@ pub struct SsePayloadAttributes {
     #[superstruct(getter(copy))]
     pub prev_randao: Hash256,
     #[superstruct(getter(copy))]
+    #[serde(with = "serde_utils::address_hex")]
     pub suggested_fee_recipient: Address,
     #[superstruct(only(V2, V3))]
     pub withdrawals: Vec<Withdrawal>,
@@ -1010,6 +1052,7 @@ pub struct SseExtendedPayloadAttributesGeneric<T> {
     pub parent_block_root: Hash256,
     #[serde(with = "serde_utils::quoted_u64")]
     pub parent_block_number: u64,
+
     pub parent_block_hash: ExecutionBlockHash,
     pub payload_attributes: T,
 }
@@ -1082,6 +1125,8 @@ pub enum EventKind<E: EthSpec> {
     PayloadAttributes(VersionedSsePayloadAttributes),
     ProposerSlashing(Box<ProposerSlashing>),
     AttesterSlashing(Box<AttesterSlashing<E>>),
+    BlsToExecutionChange(Box<SignedBlsToExecutionChange>),
+    BlockGossip(Box<BlockGossip>),
 }
 
 impl<E: EthSpec> EventKind<E> {
@@ -1103,6 +1148,8 @@ impl<E: EthSpec> EventKind<E> {
             EventKind::BlockReward(_) => "block_reward",
             EventKind::ProposerSlashing(_) => "proposer_slashing",
             EventKind::AttesterSlashing(_) => "attester_slashing",
+            EventKind::BlsToExecutionChange(_) => "bls_to_execution_change",
+            EventKind::BlockGossip(_) => "block_gossip",
         }
     }
 
@@ -1193,6 +1240,14 @@ impl<E: EthSpec> EventKind<E> {
                     ServerError::InvalidServerSentEvent(format!("Proposer Slashing: {:?}", e))
                 })?,
             )),
+            "bls_to_execution_change" => Ok(EventKind::BlsToExecutionChange(
+                serde_json::from_str(data).map_err(|e| {
+                    ServerError::InvalidServerSentEvent(format!("Bls To Execution Change: {:?}", e))
+                })?,
+            )),
+            "block_gossip" => Ok(EventKind::BlockGossip(serde_json::from_str(data).map_err(
+                |e| ServerError::InvalidServerSentEvent(format!("Block Gossip: {:?}", e)),
+            )?)),
             _ => Err(ServerError::InvalidServerSentEvent(
                 "Could not parse event tag".to_string(),
             )),
@@ -1226,6 +1281,8 @@ pub enum EventTopic {
     BlockReward,
     AttesterSlashing,
     ProposerSlashing,
+    BlsToExecutionChange,
+    BlockGossip,
 }
 
 impl FromStr for EventTopic {
@@ -1249,6 +1306,8 @@ impl FromStr for EventTopic {
             "block_reward" => Ok(EventTopic::BlockReward),
             "attester_slashing" => Ok(EventTopic::AttesterSlashing),
             "proposer_slashing" => Ok(EventTopic::ProposerSlashing),
+            "bls_to_execution_change" => Ok(EventTopic::BlsToExecutionChange),
+            "block_gossip" => Ok(EventTopic::BlockGossip),
             _ => Err("event topic cannot be parsed.".to_string()),
         }
     }
@@ -1273,6 +1332,8 @@ impl fmt::Display for EventTopic {
             EventTopic::BlockReward => write!(f, "block_reward"),
             EventTopic::AttesterSlashing => write!(f, "attester_slashing"),
             EventTopic::ProposerSlashing => write!(f, "proposer_slashing"),
+            EventTopic::BlsToExecutionChange => write!(f, "bls_to_execution_change"),
+            EventTopic::BlockGossip => write!(f, "block_gossip"),
         }
     }
 }
@@ -1690,11 +1751,11 @@ impl<E: EthSpec> ForkVersionDeserialize for FullBlockContents<E> {
     }
 }
 
-impl<E: EthSpec> Into<BeaconBlock<E>> for FullBlockContents<E> {
-    fn into(self) -> BeaconBlock<E> {
-        match self {
-            Self::BlockContents(block_and_sidecars) => block_and_sidecars.block,
-            Self::Block(block) => block,
+impl<E: EthSpec> From<FullBlockContents<E>> for BeaconBlock<E> {
+    fn from(from: FullBlockContents<E>) -> BeaconBlock<E> {
+        match from {
+            FullBlockContents::<E>::BlockContents(block_and_sidecars) => block_and_sidecars.block,
+            FullBlockContents::<E>::Block(block) => block,
         }
     }
 }
@@ -1732,12 +1793,12 @@ impl TryFrom<&HeaderMap> for ProduceBlockV3Metadata {
             })?;
         let execution_payload_value =
             parse_required_header(headers, EXECUTION_PAYLOAD_VALUE_HEADER, |s| {
-                Uint256::from_dec_str(s)
+                Uint256::from_str_radix(s, 10)
                     .map_err(|e| format!("invalid {EXECUTION_PAYLOAD_VALUE_HEADER}: {e:?}"))
             })?;
         let consensus_block_value =
             parse_required_header(headers, CONSENSUS_BLOCK_VALUE_HEADER, |s| {
-                Uint256::from_dec_str(s)
+                Uint256::from_str_radix(s, 10)
                     .map_err(|e| format!("invalid {CONSENSUS_BLOCK_VALUE_HEADER}: {e:?}"))
             })?;
 

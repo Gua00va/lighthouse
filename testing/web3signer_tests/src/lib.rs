@@ -22,7 +22,7 @@ mod tests {
     };
     use eth2_keystore::KeystoreBuilder;
     use eth2_network_config::Eth2NetworkConfig;
-    use lazy_static::lazy_static;
+    use logging::test_logger;
     use parking_lot::Mutex;
     use reqwest::Client;
     use serde::Serialize;
@@ -33,13 +33,13 @@ mod tests {
     use std::future::Future;
     use std::path::PathBuf;
     use std::process::{Child, Command, Stdio};
-    use std::sync::Arc;
+    use std::sync::{Arc, LazyLock};
     use std::time::{Duration, Instant};
     use task_executor::TaskExecutor;
     use tempfile::{tempdir, TempDir};
     use tokio::sync::OnceCell;
     use tokio::time::sleep;
-    use types::*;
+    use types::{attestation::AttestationBase, *};
     use url::Url;
     use validator_client::{
         initialized_validators::{
@@ -57,12 +57,13 @@ mod tests {
     /// debugging.
     const SUPPRESS_WEB3SIGNER_LOGS: bool = true;
 
-    lazy_static! {
-        static ref TEMP_DIR: Arc<Mutex<TempDir>> = Arc::new(Mutex::new(
-            tempdir().expect("Failed to create temporary directory")
-        ));
-        static ref GET_WEB3SIGNER_BIN: OnceCell<()> = OnceCell::new();
-    }
+    static TEMP_DIR: LazyLock<Arc<Mutex<TempDir>>> = LazyLock::new(|| {
+        Arc::new(Mutex::new(
+            tempdir().expect("Failed to create temporary directory"),
+        ))
+    });
+
+    static GET_WEB3SIGNER_BIN: OnceCell<()> = OnceCell::const_new();
 
     type E = MainnetEthSpec;
 
@@ -318,7 +319,7 @@ mod tests {
             using_web3signer: bool,
             spec: ChainSpec,
         ) -> Self {
-            let log = environment::null_logger().unwrap();
+            let log = test_logger();
             let validator_dir = TempDir::new().unwrap();
 
             let config = validator_client::Config::default();
@@ -542,7 +543,7 @@ mod tests {
 
     /// Get a generic, arbitrary attestation for signing.
     fn get_attestation() -> Attestation<E> {
-        Attestation {
+        Attestation::Base(AttestationBase {
             aggregation_bits: BitList::with_capacity(1).unwrap(),
             data: AttestationData {
                 slot: <_>::default(),
@@ -558,7 +559,7 @@ mod tests {
                 },
             },
             signature: AggregateSignature::empty(),
-        }
+        })
     }
 
     fn get_validator_registration(pubkey: PublicKeyBytes) -> ValidatorRegistrationData {
@@ -778,28 +779,28 @@ mod tests {
 
         let first_attestation = || {
             let mut attestation = get_attestation();
-            attestation.data.source.epoch = Epoch::new(1);
-            attestation.data.target.epoch = Epoch::new(4);
+            attestation.data_mut().source.epoch = Epoch::new(1);
+            attestation.data_mut().target.epoch = Epoch::new(4);
             attestation
         };
 
         let double_vote_attestation = || {
             let mut attestation = first_attestation();
-            attestation.data.beacon_block_root = Hash256::from_low_u64_be(1);
+            attestation.data_mut().beacon_block_root = Hash256::from_low_u64_be(1);
             attestation
         };
 
         let surrounding_attestation = || {
             let mut attestation = first_attestation();
-            attestation.data.source.epoch = Epoch::new(0);
-            attestation.data.target.epoch = Epoch::new(5);
+            attestation.data_mut().source.epoch = Epoch::new(0);
+            attestation.data_mut().target.epoch = Epoch::new(5);
             attestation
         };
 
         let surrounded_attestation = || {
             let mut attestation = first_attestation();
-            attestation.data.source.epoch = Epoch::new(2);
-            attestation.data.target.epoch = Epoch::new(3);
+            attestation.data_mut().source.epoch = Epoch::new(2);
+            attestation.data_mut().target.epoch = Epoch::new(3);
             attestation
         };
 
@@ -901,13 +902,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prater_base_types() {
-        test_base_types("prater", 4246).await
+    async fn mainnet_bellatrix_types() {
+        test_bellatrix_types("mainnet", 4244).await
     }
 
     #[tokio::test]
-    async fn prater_altair_types() {
-        test_altair_types("prater", 4247).await
+    async fn holesky_bellatrix_types() {
+        // web3signer does not support forks prior to Bellatrix on Holesky
+        test_bellatrix_types("holesky", 4247).await
     }
 
     #[tokio::test]
