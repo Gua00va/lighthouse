@@ -265,7 +265,7 @@ async fn test_verify_attestation_rewards_base_inactivity_leak() {
     // apply proposal rewards calculated at N (target_epoch)
     let expected_balances = apply_beacon_block_rewards(&proposal_rewards_map, expected_balances);
 
-    // verify expected balances against actual balances
+    // verify expected balances against actual balances via assert_eq
     let balances: Vec<u64> = harness.get_current_state().balances().to_vec();
     assert_eq!(expected_balances, balances);
 }
