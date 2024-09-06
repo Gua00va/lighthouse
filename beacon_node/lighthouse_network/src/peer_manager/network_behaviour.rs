@@ -4,6 +4,7 @@ use std::net::IpAddr;
 use std::task::{Context, Poll};
 
 use futures::StreamExt;
+use libp2p::core::transport::PortUse;
 use libp2p::core::ConnectedPoint;
 use libp2p::identity::PeerId;
 use libp2p::swarm::behaviour::{ConnectionClosed, ConnectionEstablished, DialFailure, FromSwarm};
@@ -14,7 +15,6 @@ use slog::{debug, error, trace};
 use types::EthSpec;
 
 use crate::discovery::enr_ext::EnrExt;
-use crate::peer_manager::peerdb::BanResult;
 use crate::rpc::GoodbyeReason;
 use crate::types::SyncState;
 use crate::{metrics, ClearDialError};
@@ -201,7 +201,7 @@ impl<E: EthSpec> NetworkBehaviour for PeerManager<E> {
     ) -> Result<libp2p::swarm::THandler<Self>, ConnectionDenied> {
         trace!(self.log, "Inbound connection"; "peer_id" => %peer_id, "multiaddr" => %remote_addr);
         // We already checked if the peer was banned on `handle_pending_inbound_connection`.
-        if let Some(BanResult::BadScore) = self.ban_status(&peer_id) {
+        if self.ban_status(&peer_id).is_some() {
             return Err(ConnectionDenied::new(
                 "Connection to peer rejected: peer has a bad score",
             ));
@@ -215,6 +215,7 @@ impl<E: EthSpec> NetworkBehaviour for PeerManager<E> {
         peer_id: PeerId,
         addr: &libp2p::Multiaddr,
         _role_override: libp2p::core::Endpoint,
+        _port_use: PortUse,
     ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
         trace!(self.log, "Outbound connection"; "peer_id" => %peer_id, "multiaddr" => %addr);
         match self.ban_status(&peer_id) {
@@ -239,10 +240,6 @@ impl<E: EthSpec> PeerManager<E> {
             "connection" => ?endpoint.to_endpoint()
         );
 
-        if other_established == 0 {
-            self.events.push(PeerManagerEvent::MetaData(peer_id));
-        }
-
         // Update the prometheus metrics
         if self.metrics_enabled {
             metrics::inc_counter(&metrics::PEER_CONNECT_EVENT_COUNT);
@@ -264,6 +261,10 @@ impl<E: EthSpec> PeerManager<E> {
             // Gracefully disconnect the peer.
             self.disconnect_peer(peer_id, GoodbyeReason::TooManyPeers);
             return;
+        }
+
+        if other_established == 0 {
+            self.events.push(PeerManagerEvent::MetaData(peer_id));
         }
 
         // NOTE: We don't register peers that we are disconnecting immediately. The network service

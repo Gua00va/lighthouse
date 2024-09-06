@@ -37,9 +37,9 @@ impl From<[u8; GRAFFITI_BYTES_LEN]> for Graffiti {
     }
 }
 
-impl Into<[u8; GRAFFITI_BYTES_LEN]> for Graffiti {
-    fn into(self) -> [u8; GRAFFITI_BYTES_LEN] {
-        self.0
+impl From<Graffiti> for [u8; GRAFFITI_BYTES_LEN] {
+    fn from(from: Graffiti) -> [u8; GRAFFITI_BYTES_LEN] {
+        from.0
     }
 }
 
@@ -77,9 +77,9 @@ impl<'de> Deserialize<'de> for GraffitiString {
     }
 }
 
-impl Into<Graffiti> for GraffitiString {
-    fn into(self) -> Graffiti {
-        let graffiti_bytes = self.0.as_bytes();
+impl From<GraffitiString> for Graffiti {
+    fn from(from: GraffitiString) -> Graffiti {
+        let graffiti_bytes = from.0.as_bytes();
         let mut graffiti = [0; GRAFFITI_BYTES_LEN];
 
         let graffiti_len = std::cmp::min(graffiti_bytes.len(), GRAFFITI_BYTES_LEN);
@@ -90,7 +90,11 @@ impl Into<Graffiti> for GraffitiString {
         graffiti
             .get_mut(..graffiti_len)
             .expect("graffiti_len <= GRAFFITI_BYTES_LEN")
-            .copy_from_slice(graffiti_bytes);
+            .copy_from_slice(
+                graffiti_bytes
+                    .get(..graffiti_len)
+                    .expect("graffiti_len <= GRAFFITI_BYTES_LEN"),
+            );
         graffiti.into()
     }
 }
@@ -180,6 +184,6 @@ impl TreeHash for Graffiti {
 
 impl TestRandom for Graffiti {
     fn random_for_test(rng: &mut impl RngCore) -> Self {
-        Self::from(Hash256::random_for_test(rng).to_fixed_bytes())
+        Self::from(Hash256::random_for_test(rng).0)
     }
 }

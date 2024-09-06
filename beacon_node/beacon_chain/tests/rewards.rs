@@ -1,6 +1,7 @@
 #![cfg(test)]
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use beacon_chain::test_utils::{
     generate_deterministic_keypairs, BeaconChainHarness, EphemeralHarnessType,
@@ -12,7 +13,6 @@ use beacon_chain::{
 use eth2::lighthouse::attestation_rewards::TotalAttestationRewards;
 use eth2::lighthouse::StandardAttestationRewards;
 use eth2::types::ValidatorId;
-use lazy_static::lazy_static;
 use types::beacon_state::Error as BeaconStateError;
 use types::{BeaconState, ChainSpec, ForkName, Slot};
 
@@ -20,9 +20,8 @@ pub const VALIDATOR_COUNT: usize = 64;
 
 type E = MinimalEthSpec;
 
-lazy_static! {
-    static ref KEYPAIRS: Vec<Keypair> = generate_deterministic_keypairs(VALIDATOR_COUNT);
-}
+static KEYPAIRS: LazyLock<Vec<Keypair>> =
+    LazyLock::new(|| generate_deterministic_keypairs(VALIDATOR_COUNT));
 
 fn get_harness(spec: ChainSpec) -> BeaconChainHarness<EphemeralHarnessType<E>> {
     let harness = BeaconChainHarness::builder(E::default())
@@ -265,7 +264,7 @@ async fn test_verify_attestation_rewards_base_inactivity_leak() {
     // apply proposal rewards calculated at N (target_epoch)
     let expected_balances = apply_beacon_block_rewards(&proposal_rewards_map, expected_balances);
 
-    // verify expected balances against actual balances
+    // verify expected balances against actual balances via assert_eq
     let balances: Vec<u64> = harness.get_current_state().balances().to_vec();
     assert_eq!(expected_balances, balances);
 }
@@ -278,23 +277,47 @@ async fn test_verify_attestation_rewards_base_inactivity_leak_justification_epoc
     let half = VALIDATOR_COUNT / 2;
     let half_validators: Vec<usize> = (0..half).collect();
     // target epoch is the epoch where the chain enters inactivity leak
-    let mut target_epoch = &spec.min_epochs_to_inactivity_penalty + 2;
+    let target_epoch = &spec.min_epochs_to_inactivity_penalty + 3;
 
-    // advance until beginning of epoch N + 2
+    // advance until beginning of epoch N (target_epoch)
     harness
         .extend_chain(
-            (E::slots_per_epoch() * (target_epoch + 1)) as usize,
+            (E::slots_per_epoch() * (target_epoch)) as usize,
             BlockStrategy::OnCanonicalHead,
             AttestationStrategy::SomeValidators(half_validators.clone()),
         )
         .await;
 
-    // advance to create first justification epoch and get initial balances
-    harness.extend_slots(E::slots_per_epoch() as usize).await;
-    target_epoch += 1;
-    let initial_balances: Vec<u64> = harness.get_current_state().balances().to_vec();
+    let mut proposal_rewards_map: HashMap<u64, u64> = HashMap::new();
+    // advance to N + 1, create first justification epoch, and calculate proposal rewards
+    for _ in 0..E::slots_per_epoch() {
+        let state = harness.get_current_state();
+        let slot = state.slot() + Slot::new(1);
 
-    //assert previous_justified_checkpoint matches 0 as we were in inactivity leak from beginning
+        let ((signed_block, _maybe_blob_sidecars), mut state) =
+            harness.make_block_return_pre_state(state, slot).await;
+        let beacon_block_reward = harness
+            .chain
+            .compute_beacon_block_reward(
+                signed_block.message(),
+                signed_block.canonical_root(),
+                &mut state,
+            )
+            .unwrap();
+
+        let total_proposer_reward = proposal_rewards_map
+            .get(&beacon_block_reward.proposer_index)
+            .unwrap_or(&0u64)
+            + beacon_block_reward.total;
+
+        proposal_rewards_map.insert(beacon_block_reward.proposer_index, total_proposer_reward);
+
+        harness.extend_slots(1).await;
+    }
+    // get initial balances
+    let initial_balances = harness.get_current_state().balances().to_vec();
+
+    // assert previous_justified_checkpoint matches 0 as we were in inactivity leak from beginning
     assert_eq!(
         0,
         harness
@@ -304,10 +327,10 @@ async fn test_verify_attestation_rewards_base_inactivity_leak_justification_epoc
             .as_u64()
     );
 
-    // extend slots to beginning of epoch N + 1
+    // extend slots to beginning of epoch N + 2
     harness.extend_slots(E::slots_per_epoch() as usize).await;
 
-    //assert target epoch and previous_justified_checkpoint match
+    // assert target epoch and previous_justified_checkpoint match
     assert_eq!(
         target_epoch,
         harness
@@ -333,6 +356,7 @@ async fn test_verify_attestation_rewards_base_inactivity_leak_justification_epoc
 
     // apply attestation rewards to initial balances
     let expected_balances = apply_attestation_rewards(&initial_balances, total_rewards);
+    let expected_balances = apply_beacon_block_rewards(&proposal_rewards_map, expected_balances);
 
     // verify expected balances against actual balances
     let balances: Vec<u64> = harness.get_current_state().balances().to_vec();

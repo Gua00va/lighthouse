@@ -66,12 +66,14 @@ use beacon_chain::{
 };
 use clap::ArgMatches;
 use clap_utils::{parse_optional, parse_required};
-use environment::{null_logger, Environment};
+use environment::Environment;
 use eth2::{
     types::{BlockId, StateId},
     BeaconNodeHttpClient, SensitiveUrl, Timeouts,
 };
 use eth2_network_config::Eth2NetworkConfig;
+use log::{debug, info};
+use sloggers::{null::NullLoggerBuilder, Build};
 use ssz::Encode;
 use state_processing::state_advance::complete_state_advance;
 use state_processing::{
@@ -117,9 +119,9 @@ pub fn run<E: EthSpec>(
     let beacon_url: Option<SensitiveUrl> = parse_optional(matches, "beacon-url")?;
     let runs: usize = parse_required(matches, "runs")?;
     let config = Config {
-        no_signature_verification: matches.is_present("no-signature-verification"),
-        exclude_cache_builds: matches.is_present("exclude-cache-builds"),
-        exclude_post_block_thc: matches.is_present("exclude-post-block-thc"),
+        no_signature_verification: matches.get_flag("no-signature-verification"),
+        exclude_cache_builds: matches.get_flag("exclude-cache-builds"),
+        exclude_post_block_thc: matches.get_flag("exclude-post-block-thc"),
     };
 
     info!("Using {} spec", E::spec_name());
@@ -195,7 +197,9 @@ pub fn run<E: EthSpec>(
     let store = HotColdDB::open_ephemeral(
         <_>::default(),
         spec.clone(),
-        null_logger().map_err(|e| format!("Failed to create null_logger: {:?}", e))?,
+        NullLoggerBuilder
+            .build()
+            .map_err(|e| format!("Error on NullLoggerBuilder: {:?}", e))?,
     )
     .map_err(|e| format!("Failed to create ephemeral store: {:?}", e))?;
     let store = Arc::new(store);
@@ -390,7 +394,7 @@ fn do_transition<E: EthSpec>(
         // Signature verification should prime the indexed attestation cache.
         assert_eq!(
             ctxt.num_cached_indexed_attestations(),
-            block.message().body().attestations().len()
+            block.message().body().attestations_len()
         );
     }
 
